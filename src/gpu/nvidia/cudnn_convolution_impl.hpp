@@ -508,7 +508,7 @@ public:
         bool fused = conv_bias || conv_bias_eltwise;
 
         float scale = 1.0f;
-        if (src_scale || wei_scale) {
+        if (src_scale || wei_scale || dst_scale) {
             if (src_scale) {
                 float host_src_scale = 1.0f;
                 CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_src_scale,
@@ -520,6 +520,13 @@ public:
                 CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_wei_scale,
                         (CUdeviceptr)wei_scale, sizeof(float));
                 scale *= host_wei_scale;
+            }
+            if(dst_scale) {
+                float host_dst_scale = 1.0f;
+                CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_dst_scale,
+                        (CUdeviceptr)dst_scale, sizeof(float));
+                float inv_scale = 1.0f / host_dst_scale;
+                scale *= inv_scale;
             }
         }
 
@@ -584,15 +591,6 @@ public:
 
         if (need_reorder) {
             execute_reorder(handle, post_op_scratch, y, false);
-        }
-
-        if (dst_scale) {
-            float host_dst_scale = 1.0f;
-            CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_dst_scale,
-                    (CUdeviceptr)dst_scale, sizeof(float));
-            float inv_scale = 1.0f / host_dst_scale;
-            CUDNN_EXECUTE_FUNC(
-                    cudnnScaleTensor, handle, descs[io::y], y, &inv_scale);
         }
     }
     status_t init_scratchpad(engine_t *engine, convolution_pd_t *pd) override {
