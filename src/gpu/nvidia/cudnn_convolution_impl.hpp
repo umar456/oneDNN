@@ -521,7 +521,7 @@ public:
                         (CUdeviceptr)wei_scale, sizeof(float));
                 scale *= host_wei_scale;
             }
-            if(dst_scale) {
+            if (dst_scale) {
                 float host_dst_scale = 1.0f;
                 CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_dst_scale,
                         (CUdeviceptr)dst_scale, sizeof(float));
