@@ -395,6 +395,7 @@ protected:
     cudnnActivationDescriptor_t activation_desc = nullptr;
     cudnnActivationDescriptor_t eltwise_desc = nullptr;
     cudnnTensorDescriptor_t reorder_dst_desc = nullptr;
+    cudnnTensorDescriptor_t y_fp32_desc = nullptr;
     cudnnConvolutionFwdAlgo_t fwd_alg_kind;
     std::vector<cudnnConvolutionFwdAlgoPerf_t> perf;
     int requested_algo_count = 0;
@@ -508,7 +509,7 @@ public:
         bool fused = conv_bias || conv_bias_eltwise;
 
         float scale = 1.0f;
-        if (src_scale || wei_scale || dst_scale) {
+        if (src_scale || wei_scale) {
             if (src_scale) {
                 float host_src_scale = 1.0f;
                 CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_src_scale,
@@ -521,41 +522,74 @@ public:
                         (CUdeviceptr)wei_scale, sizeof(float));
                 scale *= host_wei_scale;
             }
-            if (dst_scale) {
-                float host_dst_scale = 1.0f;
-                CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_dst_scale,
-                        (CUdeviceptr)dst_scale, sizeof(float));
-                float inv_scale = 1.0f / host_dst_scale;
-                scale *= inv_scale;
-            }
         }
 
-        if (fused) {
-            auto err = cudnnConvolutionBiasActivationForward(handle, &scale,
-                    descs[io::x], x, weights_desc, weights, conv_desc,
-                    fwd_alg_kind, scratchpad, scratchpad_size, &beta,
-                    descs[io::y], output, descs[io::bias], bias,
-                    conv_bias_eltwise ? eltwise_desc : activation_desc,
-                    descs[io::y], output);
-            // try to fallback into standalone convolution
-            if (err == CUDNN_STATUS_NOT_SUPPORTED) {
-                fused = false;
-            } else {
-                CUDNN_CHECK_V(err);
-            }
-        }
+        float *y_fp32_data = nullptr;
+        dim_t size_output = 1;
+        if (dst_scale && data_types[io::y] == CUDNN_DATA_INT8) {
+            // Compute the size output to pass as a parameter to the
+            // memory allocation call.
+            for (size_t i = 0; i < ndims[io::y]; i++)
+                size_output *= dims[io::y][i];
+            CUDA_EXECUTE_FUNC(cuMemAlloc, (CUdeviceptr *)&y_fp32_data,
+                    size_output * sizeof(float));
 
-        if (!fused) {
-            const float bias_alpha = 1.0f;
-            const float bias_beta = 1.0f;
-            CUDNN_EXECUTE_FUNC_V(cudnnConvolutionForward, handle, &scale,
-                    descs[io::x], x, weights_desc, weights, conv_desc,
-                    fwd_alg_kind, scratchpad, scratchpad_size, &beta,
-                    descs[io::y], output);
-            if (with_bias) {
-                CUDNN_EXECUTE_FUNC_V(cudnnAddTensor, handle, &bias_alpha,
-                        descs[io::bias], bias, &bias_beta, descs[io::y],
-                        output);
+            if (fused) {
+                auto err = cudnnConvolutionBiasActivationForward(handle, &scale,
+                        descs[io::x], x, weights_desc, weights, conv_desc,
+                        fwd_alg_kind, scratchpad, scratchpad_size, &beta,
+                        descs[io::y], output, descs[io::bias], bias,
+                        conv_bias_eltwise ? eltwise_desc : activation_desc,
+                        y_fp32_desc, y_fp32_data);
+                // try to fallback into standalone convolution
+                if (err == CUDNN_STATUS_NOT_SUPPORTED) {
+                    fused = false;
+                } else {
+                    CUDNN_CHECK_V(err);
+                }
+            }
+
+            if (!fused) {
+                const float bias_alpha = 1.0f;
+                const float bias_beta = 1.0f;
+                CUDNN_EXECUTE_FUNC_V(cudnnConvolutionForward, handle, &scale,
+                        descs[io::x], x, weights_desc, weights, conv_desc,
+                        fwd_alg_kind, scratchpad, scratchpad_size, &beta,
+                        y_fp32_desc, y_fp32_data);
+                if (with_bias) {
+                    CUDNN_EXECUTE_FUNC_V(cudnnAddTensor, handle, &bias_alpha,
+                            descs[io::bias], bias, &bias_beta, y_fp32_desc,
+                            y_fp32_data);
+                }
+            }
+        } else {
+            if (fused) {
+                auto err = cudnnConvolutionBiasActivationForward(handle, &scale,
+                        descs[io::x], x, weights_desc, weights, conv_desc,
+                        fwd_alg_kind, scratchpad, scratchpad_size, &beta,
+                        descs[io::y], output, descs[io::bias], bias,
+                        conv_bias_eltwise ? eltwise_desc : activation_desc,
+                        descs[io::y], output);
+                // try to fallback into standalone convolution
+                if (err == CUDNN_STATUS_NOT_SUPPORTED) {
+                    fused = false;
+                } else {
+                    CUDNN_CHECK_V(err);
+                }
+            }
+
+            if (!fused) {
+                const float bias_alpha = 1.0f;
+                const float bias_beta = 1.0f;
+                CUDNN_EXECUTE_FUNC_V(cudnnConvolutionForward, handle, &scale,
+                        descs[io::x], x, weights_desc, weights, conv_desc,
+                        fwd_alg_kind, scratchpad, scratchpad_size, &beta,
+                        descs[io::y], output);
+                if (with_bias) {
+                    CUDNN_EXECUTE_FUNC_V(cudnnAddTensor, handle, &bias_alpha,
+                            descs[io::bias], bias, &bias_beta, descs[io::y],
+                            output);
+                }
             }
         }
         // skip first eltwise in case it is fused into convolution
@@ -592,6 +626,40 @@ public:
         if (need_reorder) {
             execute_reorder(handle, post_op_scratch, y, false);
         }
+
+        if (dst_scale) {
+            float host_dst_scale = 1.0f;
+            CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_dst_scale,
+                    (CUdeviceptr)dst_scale, sizeof(float));
+            float inv_scale = 1.0f / host_dst_scale;
+            if (data_types[io::y] == CUDNN_DATA_INT8) {
+                cudnnOpTensorDescriptor_t opTensorDesc;
+                CUDNN_EXECUTE_FUNC_V(
+                        cudnnCreateOpTensorDescriptor, &opTensorDesc);
+
+                cudnnOpTensorOp_t opTensorOp = CUDNN_OP_TENSOR_ADD;
+                cudnnDataType_t opTensorCompType = CUDNN_DATA_FLOAT;
+                cudnnNanPropagation_t opTensorNanOpt = CUDNN_NOT_PROPAGATE_NAN;
+                CUDNN_EXECUTE_FUNC_S(cudnnSetOpTensorDescriptor, opTensorDesc,
+                        opTensorOp, opTensorCompType, opTensorNanOpt);
+
+                float alpha_beta = 0.0f;
+                CUDNN_EXECUTE_FUNC(cudnnOpTensor, handle, opTensorDesc,
+                        &inv_scale, y_fp32_desc, y_fp32_data, &alpha_beta,
+                        y_fp32_desc, y_fp32_data, &alpha_beta, descs[io::y], y);
+
+                if (y_fp32_desc)
+                    CUDNN_EXECUTE_FUNC_V(
+                            cudnnDestroyTensorDescriptor, y_fp32_desc);
+                if (opTensorDesc)
+                    CUDNN_EXECUTE_FUNC_V(
+                            cudnnDestroyOpTensorDescriptor, opTensorDesc);
+                CUDA_EXECUTE_FUNC(cuMemFree, (CUdeviceptr)y_fp32_data);
+            } else {
+                CUDNN_EXECUTE_FUNC(
+                        cudnnScaleTensor, handle, descs[io::y], y, &inv_scale);
+            }
+        }
     }
     status_t init_scratchpad(engine_t *engine, convolution_pd_t *pd) override {
         auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(engine);
@@ -602,9 +670,18 @@ public:
                 = utils::downcast<sycl_cuda_stream_t *>(service_stream);
         auto handle = cuda_stream->get_cudnn_handle();
 
-        CHECK(CUDNN_EXECUTE_FUNC_S(cudnnGetConvolutionForwardWorkspaceSize,
-                handle, descs[x], weights_desc, conv_desc, descs[y],
-                fwd_alg_kind, &scratchpad_size));
+        if (data_types[y] == CUDNN_DATA_INT8 && do_scaling) {
+            CHECK(create_and_set_tensor_descriptor(&y_fp32_desc,
+                    CUDNN_DATA_FLOAT, ndims[y], dims[y], strides[y]));
+            CHECK(CUDNN_EXECUTE_FUNC_S(cudnnGetConvolutionForwardWorkspaceSize,
+                    handle, descs[x], weights_desc, conv_desc, y_fp32_desc,
+                    fwd_alg_kind, &scratchpad_size));
+        } else {
+            CHECK(CUDNN_EXECUTE_FUNC_S(cudnnGetConvolutionForwardWorkspaceSize,
+                    handle, descs[x], weights_desc, conv_desc, descs[y],
+                    fwd_alg_kind, &scratchpad_size));
+        }
+
         if (scratchpad_size > 0)
             pd->scratchpad_registry().registrar().book(
                     memory_tracking::names::key_conv_cudnn_algo,
