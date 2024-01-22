@@ -317,6 +317,22 @@ def convert_dts(mds, prim_kind):
             dt += " " + f"--bia_dt={bias_dt}"
         return dt
 
+    def convert_dts_with_ss(mds):
+        dt = convert_dts_multiple(mds)
+        mds_scale = [md for md in mds if "scale" in md["arg"]]
+        mds_shift = [md for md in mds if "shift" in md["arg"]]
+
+        if len(mds_scale) != 0:
+            md_scale = mds_scale[0]
+            scale_dt = md_scale["data_type"]
+            dt += " " + f"--ss_dt={scale_dt}"
+        elif len(mds_shift) != 0:
+            md_shift = mds_shift[0]
+            shift_dt = md_shift["data_type"]
+            dt += " " + f"--ss_dt={shift_dt}"
+
+        return dt
+
     convert_dts = {
         "batch_normalization": convert_dts_common,
         "binary": convert_dts_multiple_src,
@@ -326,7 +342,7 @@ def convert_dts(mds, prim_kind):
         "eltwise": convert_dts_common,
         "inner_product": convert_dts_multiple,
         "group_normalization": convert_dts_multiple,
-        "layer_normalization": convert_dts_multiple,
+        "layer_normalization": convert_dts_with_ss,
         "lrn": convert_dts_common,
         "matmul": convert_dts_with_bias,
         "pooling": convert_dts_multiple,
@@ -397,11 +413,19 @@ def convert_tags(mds, prim_kind):
                 tags += f" --{md_arg}tag=any"
             else:
                 md_strides = md["strides"]
-                if md_strides == "":
+
+                def tag_has_blocks(string):
+                    for l in string:
+                        if l.isupper():
+                            return True
+                    return False
+
+                md_tag_has_blocks = tag_has_blocks(md["tag"])
+                if md_strides != "" and not md_tag_has_blocks:
+                    strides += f"{md_strides}"
+                else:
                     md_tag = md["tag"]
                     tags += f" --{md_arg}tag={md_tag}"
-                else:
-                    strides += f"{md_strides}"
             if md_arg != "d":
                 strides += f":"
 
@@ -498,7 +522,7 @@ def convert_tags(mds, prim_kind):
         "pooling": convert_tags_common,
         "prelu": convert_tags_prelu,
         "reduction": convert_tags_all,
-        "reorder": convert_tags_all,
+        "reorder": convert_tags_and_strides,
         "resampling": convert_tags_common,
         "rnn": convert_tags_rnn,
         "shuffle": convert_tags_common,
@@ -701,8 +725,10 @@ def convert_scratchpad_mode(scratchpad_mode, prim_kind):
 def convert_fpmath_mode(fpmath_mode, prim_kind):
     return fpmath_mode
 
+
 def convert_acc_mode(acc_mode, prim_kind):
     return acc_mode
+
 
 def convert_attrs(exts, prim_kind):
     converters = {

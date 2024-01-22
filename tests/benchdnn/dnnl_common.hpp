@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <vector>
+#include <unordered_map>
 
 #include "oneapi/dnnl/dnnl.h"
 
@@ -31,7 +32,9 @@
 #include "utils/compare.hpp"
 #include "utils/dims.hpp"
 #include "utils/dnnl_query.hpp"
+#include "utils/fill.hpp"
 #include "utils/numeric.hpp"
+#include "utils/parallel.hpp"
 
 #include "tests/test_thread.hpp"
 
@@ -88,6 +91,8 @@ int check_primitive_cache(dnnl_primitive_t p, res_t *res);
 extern dnnl_engine_kind_t engine_tgt_kind;
 extern size_t engine_index;
 extern isa_hints_t hints;
+extern int default_num_streams;
+extern int num_streams;
 
 struct engine_t {
     engine_t(dnnl_engine_kind_t engine_kind);
@@ -103,13 +108,16 @@ private:
 };
 
 struct stream_t {
+    stream_t() : stream_(nullptr), is_owner_(false) {}
     stream_t(dnnl_engine_t engine, void *interop_obj = nullptr);
     ~stream_t();
     operator dnnl_stream_t() const { return stream_; }
+    stream_t &operator=(stream_t &&rhs);
 
 private:
     BENCHDNN_DISALLOW_COPY_AND_ASSIGN(stream_t);
     dnnl_stream_t stream_;
+    bool is_owner_;
 };
 
 // Engine used to run oneDNN primitives for testing.
@@ -119,7 +127,7 @@ inline const engine_t &get_test_engine() {
 }
 
 // Engine used to run all reference native implementations and CPU
-// implementations used by `--fast-ref-gpu` option.
+// implementations used by `--fast-ref` option.
 inline const engine_t &get_cpu_engine() {
 #if DNNL_CPU_RUNTIME == DNNL_RUNTIME_NONE
     // In case of lacking CPU engine, just re-use testing one.
@@ -202,7 +210,14 @@ struct init_pd_args_t {
     const_dnnl_memory_desc_t src_md;
 };
 
-int get_cpu_cache_size(size_t &cache_size);
+struct cpu_cache_args_t {
+    size_t L2_size = 0;
+    size_t L3_size = 0; // = L3_per_core
+    size_t num_cores = 0;
+    size_t total_socket_size = 0; // (L2 + L3_per_core) * num_cores
+};
+
+int get_cpu_cache_size(cpu_cache_args_t &cache_args);
 int get_gpu_cache_size(size_t &cache_size);
 
 bool is_fwd_prop_kind(dnnl_prop_kind_t prop_kind);
@@ -528,6 +543,12 @@ void check_correctness(const prb_t *prb, const std::vector<data_kind_t> &kinds,
         const args_t &args, const args_t &ref_args,
         const setup_cmp_func_t &setup_cmp_func, res_t *res,
         dnnl_primitive_t prim_ref = nullptr) {
+    // Fast exit for any modes but correctness.
+    if (!has_bench_mode_bit(mode_bit_t::corr)) return;
+
+    // Forward-for-backward service primitives define `kinds` as empty to skip
+    // validation. This is to avoid extra checks on higher level.
+    if (kinds.empty()) return;
 
     for (int i = 0; i < args.size(); ++i) {
         TIME_COMPARE(check_zero_padding(args.dnn_mem(i), args.arg(i), res));
@@ -539,33 +560,35 @@ void check_correctness(const prb_t *prb, const std::vector<data_kind_t> &kinds,
     for (const auto &kind : kinds) {
         compare::compare_t cmp;
         cmp.set_data_kind(kind);
+        cmp.set_has_prim_ref(bool(prim_ref));
         setup_cmp_func(cmp, prb, kind, ref_args);
 
-        int arg = 0;
-        switch (kind) {
-            case DST: arg = DNNL_ARG_DST; break;
-            case SRC: arg = DNNL_ARG_DIFF_SRC; break;
-            case SRC_1: arg = DNNL_ARG_DIFF_SRC_1; break;
-            case WEI: arg = DNNL_ARG_DIFF_WEIGHTS; break;
-            case BIA: arg = DNNL_ARG_DIFF_BIAS; break;
-            case MEAN: arg = DNNL_ARG_MEAN; break;
-            case VAR: arg = DNNL_ARG_VARIANCE; break;
-            case SC: arg = DNNL_ARG_DIFF_SCALE; break;
-            case SH: arg = DNNL_ARG_DIFF_SHIFT; break;
-            case DST_ITER: arg = DNNL_ARG_DST_ITER; break;
-            case DST_ITER_C: arg = DNNL_ARG_DST_ITER_C; break;
-            case AUGRU_ATTENTION: arg = DNNL_ARG_DIFF_AUGRU_ATTENTION; break;
-            case SRC_ITER: arg = DNNL_ARG_DIFF_SRC_ITER; break;
-            case SRC_ITER_C: arg = DNNL_ARG_DIFF_SRC_ITER_C; break;
-            case WEI_ITER: arg = DNNL_ARG_DIFF_WEIGHTS_ITER; break;
-            case WEI_PEEPHOLE: arg = DNNL_ARG_DIFF_WEIGHTS_PEEPHOLE; break;
-            case WEI_PROJECTION: arg = DNNL_ARG_DIFF_WEIGHTS_PROJECTION; break;
-            default: assert(!"unsupported kind"); SAFE_V(FAIL);
-        }
+        int arg = data_kind2exec_arg(kind);
+        assert(arg > 0);
+
         const auto &mem_dt = args.find(arg);
         const auto &mem_fp = ref_args.find(arg);
 
         TIME_COMPARE(cmp.compare(mem_fp, mem_dt, prb->attr, res));
+    }
+
+    if (prim_ref && res->state == FAILED) {
+        static cpu_cache_args_t cpu_cache_args {};
+        SAFE_V(get_cpu_cache_size(cpu_cache_args));
+
+        BENCHDNN_PRINT(0,
+                "[PRIM_REF][INFO]: L2_size:%zu bytes; per_core_L3_size:%zu "
+                "bytes; nthr:%d; impl_name:%s\n",
+                cpu_cache_args.L2_size, cpu_cache_args.L3_size,
+                benchdnn_get_max_threads(),
+                query_impl_info(query_pd(prim_ref)).c_str());
+
+        // Replace engine kind for repro line from GPU to CPU.
+        const auto eng_pos = res->prim_ref_repro.find("engine=gpu");
+        res->prim_ref_repro[eng_pos + 7] = 'c'; // Replace `g` in `gpu` with `c`
+
+        BENCHDNN_PRINT(
+                0, "[PRIM_REF][REPRO]: %s\n", res->prim_ref_repro.c_str());
     }
 }
 
@@ -839,5 +862,9 @@ void update_inplace_memory_args(
 int update_ref_mem_map_from_prim(dnnl_primitive_t prim_ref,
         const dnn_mem_t &library_mem, dnn_mem_map_t &ref_mem_map, int exec_arg,
         dnnl_data_type_t swapped_dt);
+
+int init_ref_memory_args_default_case(int exec_arg, dnn_mem_t &mem,
+        dnn_mem_t &ref_mem, const attr_t &attr, res_t *res,
+        const std::unordered_map<int, fill_cfg_t> &fill_cfg_map = {});
 
 #endif

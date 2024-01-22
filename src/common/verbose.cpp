@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2024 Intel Corporation
 * Copyright 2023 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -223,6 +223,10 @@ uint32_t get_verbose(verbose_t::flag_kind verbosity_kind,
                 // pop out the last comma
                 filter_status.components.pop_back();
                 filter_status.status = filter_status_t::flags::valid;
+            } else {
+                filter_status.status = filter_status_t::flags::invalid;
+                filter_status.err_msg
+                        = "component with name \'" + s + "\' not found";
             }
             return k;
         };
@@ -607,6 +611,8 @@ std::ostream &operator<<(std::ostream &ss, const primitive_attr_t *attr) {
         ss << "attr-acc:" << dnnl_accumulation_mode2str(am) << " ";
     }
 
+    const bool deterministic = attr->deterministic_;
+    if (deterministic) { ss << "attr-deterministic:" << deterministic << " "; }
     if (attr->has_default_values()) return ss;
 
     const runtime_scales_t &os = attr->output_scales_;
@@ -983,11 +989,21 @@ std::string init_info_layer_normalization(const engine_t *e, const pd_t *pd) {
     auto dst_md = pd->invariant_dst_md();
     auto stats_md = pd->is_fwd() && !pd->stats_are_src() ? pd->dst_md(1)
                                                          : pd->src_md(1);
+    auto scaleshift_md = pd->weights_md(0);
+    auto diff_scaleshift_md = pd->diff_weights_md(0);
 
     ss << "src_" << src_md;
     ss << " dst_" << md2fmt_str(dst_md, pd->invariant_dst_user_format_kind());
     if (stats_md) ss << " stats_" << stats_md;
+    if (pd->use_scale()) ss << " scale_" << scaleshift_md;
+    if (pd->use_shift()) ss << " shift_" << scaleshift_md;
+
     if (!pd->is_fwd()) ss << " diff_src_" << pd->diff_src_md();
+
+    if (!pd->is_fwd() && pd->use_scale())
+        ss << " diff_scale_" << diff_scaleshift_md;
+    if (!pd->is_fwd() && pd->use_shift())
+        ss << " diff_shift_" << diff_scaleshift_md;
 
     ss << "," << pd->attr() << ",";
     ss << "flags:" << normalization_flags2str(pd->desc()->flags) << ",";

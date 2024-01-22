@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -121,8 +121,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         const int exec_arg = entry.first;
         auto &mem = entry.second; // `mem` is modified by filler (reorder).
 
-        ref_mem_map.emplace(
-                exec_arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        // Scratchpad memory relates to a primitive. If reference needs it,
+        // use switch below to define a memory desc for it.
+        if (exec_arg != DNNL_ARG_SCRATCHPAD) {
+            ref_mem_map.emplace(exec_arg,
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        }
         auto &ref_mem = ref_mem_map[exec_arg];
 
         switch (exec_arg) {
@@ -130,7 +134,6 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
             case DNNL_ARG_DIFF_DST:
                 SAFE(fill_src(prb, mem, ref_mem), WARN);
                 break;
-            case DNNL_ARG_SCRATCHPAD: break;
             default: break;
         }
         // Don't keep reference memory if it is not used further.
@@ -181,10 +184,8 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     SAFE(execute_and_wait(prim, args, res), WARN);
 
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
-        check_correctness(
-                prb, get_kinds_to_check(prb), args, ref_args, setup_cmp, res);
-    }
+    check_correctness(
+            prb, get_kinds_to_check(prb), args, ref_args, setup_cmp, res);
 
     return measure_perf(prb->ctx_exe, res, prim, args);
 }

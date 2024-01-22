@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -59,15 +59,17 @@ struct jit_brgemm_kernel_t : public jit_generator {
             static constexpr bool preserve_gpr = true;
             static constexpr bool preserve_vmm = true;
             static constexpr bool use_exact_tail_scalar_bcast = false;
-            const auto dst_md_wrapper = memory_desc_wrapper(brg.dst_md);
+            const auto dst_md_wrapper = memory_desc_wrapper(brg.dst_md());
 
             static const bcast_set_t enabled_bcast_strategy
                     = {broadcasting_strategy_t::scalar,
                             broadcasting_strategy_t::per_oc,
                             broadcasting_strategy_t::per_oc_spatial,
+                            broadcasting_strategy_t::per_mb,
                             broadcasting_strategy_t::per_mb_spatial,
                             broadcasting_strategy_t::per_mb_w,
                             broadcasting_strategy_t::per_w,
+                            broadcasting_strategy_t::batch,
                             broadcasting_strategy_t::no_broadcast};
             const binary_injector::rhs_arg_static_params_t rhs_sp {
                     static_cast<size_t>(vmm_tmp(0).getIdx()), this->r14,
@@ -79,11 +81,11 @@ struct jit_brgemm_kernel_t : public jit_generator {
                     this->param1, enabled_bcast_strategy, rhs_sp};
 
             postops_injector_ = utils::make_unique<po_injector_t>(
-                    this, brg.attr->post_ops_, bsp);
+                    this, brg.attr()->post_ops_, bsp);
 
             with_binary_non_scalar_bcast_ = binary_injector::
                     any_binary_postop_rhs_non_scalar_broadcast(
-                            brg.attr->post_ops_, dst_md_wrapper);
+                            brg.attr()->post_ops_, dst_md_wrapper);
         }
         if (brg.is_bf16_emu)
             bf16_emu_ = utils::make_unique<bf16_emulation_t>(this,
@@ -2525,9 +2527,8 @@ brgemm_attr_t::brgemm_attr_t()
     , static_offsets(nullptr) {}
 
 template <cpu_isa_t isa, typename Wmm>
-brgemm_kernel_common_t<isa, Wmm>::brgemm_kernel_common_t(const brgemm_t abrd) {
-    brgemm_kernel_ = new jit_brgemm_kernel_t<isa, Wmm>(abrd);
-}
+brgemm_kernel_common_t<isa, Wmm>::brgemm_kernel_common_t(const brgemm_t &abrd)
+    : brgemm_kernel_(new jit_brgemm_kernel_t<isa, Wmm>(abrd)) {}
 
 template <cpu_isa_t isa, typename Wmm>
 status_t brgemm_kernel_common_t<isa, Wmm>::create_kernel() {

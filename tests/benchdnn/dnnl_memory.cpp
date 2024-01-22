@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
+#include "utils/cold_cache.hpp"
 #include "utils/dnnl_query.hpp"
 #include "utils/parallel.hpp"
 
@@ -93,7 +94,8 @@ dnn_mem_t::dnn_mem_t(const dnn_mem_t &rhs, dnnl_data_type_t dt,
     if (active_) {
         int status = reorder(rhs);
         if (status != OK) {
-            BENCHDNN_PRINT(0, "%s\n", "Reorder in memory constructor failed.");
+            BENCHDNN_PRINT(
+                    0, "%s\n", "Error: reorder in memory constructor failed.");
         }
     }
 }
@@ -162,6 +164,16 @@ int execute_reorder(const dnn_mem_t &src, dnn_mem_t &dst,
 int dnn_mem_t::reorder(const dnn_mem_t &rhs, const_dnnl_primitive_attr_t attr,
         dnnl_data_type_t swap_dt) {
     if (this == &rhs) return OK;
+
+    // When `rhs` object is empty, it's illigal to execute a reorder over it.
+    // Do nothing, return a good status. Keep here to avoid guarding externally.
+    if (query_md_ndims(rhs.md_) == 0) return OK;
+
+    // Assumption is `no_host_memory` assigned values at construction, and no
+    // actual reorder needed. This check is to avoid extra code outside of
+    // reorder interface.
+    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
+
     const bool do_swap_dt = swap_dt != dnnl_data_type_undef;
     dnnl_data_type_t orig_dt = this->dt();
     if (do_swap_dt) this->set_dt(swap_dt);
@@ -666,7 +678,11 @@ int dnn_mem_t::initialize(
             // Do not fill a memory if its size is zero. Moreover, memset
             // expects defined pointer, nullptr is not allowed.
             if (sz != 0) {
-                if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) {
+                // Avoid costy data reorders for cold cache mode when
+                // initializing cold cache buffers.
+                // TODO: consider enabling broadly for perf mode.
+                if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)
+                        || cold_cache_mode != default_cold_cache_mode) {
                     // Fill memory directly with 0x3F3F3F3F (0.747059f) number.
                     this->memset(dnnl_mem_default_perf_test_value, sz);
                 } else {

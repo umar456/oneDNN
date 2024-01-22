@@ -148,19 +148,6 @@ struct gpu_primitive_t : public primitive_t {
             const compute::kernel_ctx_t &kernel_ctx) {
         auto *compute_engine
                 = utils::downcast<compute::compute_engine_t *>(engine);
-
-#ifndef DISABLE_VERBOSE
-        // Print out kernel options if the correct verbosity is set
-        if (get_verbose(verbose_t::debuginfo) >= 5) {
-            std::ostringstream oss;
-            for (const char *name : kernel_names)
-                oss << name << " ";
-
-            VFORMAT(get_msec(), primitive, exec, VERBOSE_debug,
-                    "kernel options,%s,%s", oss.str().c_str(),
-                    kernel_ctx.options().c_str());
-        }
-#endif
         CHECK(compute_engine->create_kernels(
                 kernels, kernel_names, kernel_ctx, cache_blob()));
         CHECK(register_kernels(*kernels));
@@ -189,7 +176,7 @@ struct gpu_primitive_t : public primitive_t {
 
         auto key = std::make_shared<trivial_key_container_t<T>>(
                 params, compute_engine->engine_id());
-        if (!key->key.is_valid()) return status::runtime_error;
+        gpu_assert(key->key.is_valid());
 
         CHECK(get_cached_kernels<typename trivial_key_t<T>::value_type>(
                 std::move(key), engine, kernels, kernel_names));

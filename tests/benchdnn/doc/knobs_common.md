@@ -156,10 +156,11 @@ names mismatch for two descriptors. It indicates that appending an attribute
 changes the implementation dispatching which is an undesired behavior. When
 `BOOL` is `false` (the default), the check is disabled.
 
-### --fast-ref-gpu
-`--fast-ref-gpu=BOOL` instructs the driver to use an optimized implementation
+### --fast-ref
+`--fast-ref=BOOL` instructs the driver to use an optimized implementation
 from the library as a reference path for correctness comparison when `BOOL` is
-`true` (the default).
+`true` (the default). Refer to [additional documentation](knob_use_fast_ref.md)
+for more information.
 
 ## Performance mode settings
 
@@ -188,6 +189,11 @@ run. `N` is a positive integer value in a `[1e1, 6e4]` range. When a provided
 value is out of the range, it is saturated to the board values. The default is
 `3e3`, or 3 seconds. The option is useful, for example, to stabilize the
 performance numbers reported for small problems on CPU.
+
+### --num-streams
+`--num-streams=N` specifies the number `N` of streams used for performance
+benchmarking. The option takes place for GPU only and uses a single stream by
+default.
 
 ### --perf-template
 `--perf-template=STR` specifies the format of a performance report. `STR`

@@ -811,7 +811,7 @@ static inline DataType decodeRegTypecode12(unsigned dt)
         DataType::ub,      DataType::uw,      DataType::ud,      DataType::uq,
         DataType::b,       DataType::w,       DataType::d,       DataType::q,
         DataType::bf8,     DataType::hf,      DataType::f,       DataType::df,
-        DataType::invalid, DataType::bf,      DataType::tf32,    DataType::invalid,
+        DataType::invalid, DataType::bf,      DataType::tf32,    DataType::bf8
     };
     return conversionTable[dt & 0xF];
 }
@@ -974,7 +974,9 @@ bool Instruction12::getOperandRegion(autoswsb::DependencyRegion &region, int opN
             auto sub = base[sr / getBytes(base.getType())];
             auto hs = (1 << o.direct.hs);
             if (opNum >= 0) hs >>= 1;
-            if ((opNum < 0) || (opNum == 2))
+            if (opNum < 0)
+                rd = sub(hs, 1, 0);
+            else if (opNum == 2)
                 rd = sub(hs);
             else
                 rd = sub((1 << vs) >> 1, hs);
@@ -1017,7 +1019,7 @@ bool Instruction12::getOperandRegion(autoswsb::DependencyRegion &region, int opN
             auto hs = (1 << o.direct.hs) >> 1;
             auto vs = xeHPC ? o.directXeHPC.vs : o.direct.vs;
             if (opNum < 0)
-                rd = sub(hs);
+                rd = sub(hs, 1, 0);
             else
                 rd = sub((1 << vs) >> 1, 1 << o.direct.width, hs);
 

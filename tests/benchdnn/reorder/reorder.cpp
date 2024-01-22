@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -140,10 +140,10 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     for (int d = 0; d < prb->ndims; ++d)
         if (prb->runtime_dim_mask & (1 << d)) dims[d] = DNNL_RUNTIME_DIM_VAL;
 
-    auto src_d
-            = dnn_mem_t::init_md(prb->ndims, dims.data(), prb->sdt, prb->stag);
-    auto dst_d
-            = dnn_mem_t::init_md(prb->ndims, dims.data(), prb->ddt, prb->dtag);
+    auto src_d = dnn_mem_t::init_md(
+            prb->ndims, dims.data(), prb->sdt, prb->stag, prb->strides[0]);
+    auto dst_d = dnn_mem_t::init_md(
+            prb->ndims, dims.data(), prb->ddt, prb->dtag, prb->strides[1]);
 
     // Prepare and assign extra for dst_md.
     auto &extra = static_cast<dnnl_memory_desc_t>(dst_d)->extra;
@@ -399,8 +399,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         const int exec_arg = entry.first;
         auto &mem = entry.second; // `mem` is modified by filler (reorder).
 
-        ref_mem_map.emplace(
-                exec_arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        // Scratchpad memory relates to a primitive. If reference needs it,
+        // use switch below to define a memory desc for it.
+        if (exec_arg != DNNL_ARG_SCRATCHPAD) {
+            ref_mem_map.emplace(exec_arg,
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        }
         auto &ref_mem = ref_mem_map[exec_arg];
 
         switch (exec_arg) {
@@ -420,22 +424,11 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                     SAFE(fill_mem(prb, DST, mem, ref_mem), WARN);
                 }
             } break;
-            case DNNL_ARG_SCRATCHPAD: break;
-            default: { // Process all attributes here
-                bool is_scales_arg = (exec_arg & DNNL_ARG_ATTR_SCALES);
-                bool is_zero_point_arg = (exec_arg & DNNL_ARG_ATTR_ZERO_POINTS);
-
-                if (is_scales_arg) {
-                    int local_exec_arg = exec_arg ^ DNNL_ARG_ATTR_SCALES;
-                    SAFE(fill_scales(prb->attr, local_exec_arg, mem, ref_mem),
-                            WARN);
-                } else if (is_zero_point_arg) {
-                    int local_exec_arg = exec_arg ^ DNNL_ARG_ATTR_ZERO_POINTS;
-                    SAFE(fill_zero_points(
-                                 prb->attr, local_exec_arg, mem, ref_mem),
-                            WARN);
-                }
-            } break;
+            default:
+                SAFE(init_ref_memory_args_default_case(
+                             exec_arg, mem, ref_mem, prb->attr, res),
+                        WARN);
+                break;
         }
         // Don't keep reference memory if it is not used further.
         if (!has_bench_mode_bit(mode_bit_t::corr)) ref_mem_map.clear();

@@ -118,7 +118,8 @@ extern int default_fix_times_per_prb; // 0, rely on time criterion
 extern int repeats_per_prb; // test repeats per prb
 extern int default_repeats_per_prb; // default test repeats per prb
 
-extern bool fast_ref_gpu;
+extern bool fast_ref;
+extern bool default_fast_ref;
 extern bool allow_enum_tags_only;
 extern int test_start;
 
@@ -167,6 +168,7 @@ struct res_t {
     size_t errors, total;
     timer::timer_map_t timer_map;
     std::string impl_name;
+    std::string prim_ref_repro;
     skip_reason_t reason;
     size_t ibytes, obytes;
     bool mem_check_done;

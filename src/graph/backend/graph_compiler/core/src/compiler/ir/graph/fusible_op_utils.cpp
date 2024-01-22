@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -107,8 +107,6 @@ ir_module_ptr fusible_op_get_func(fusible_op_t *op, const context_ptr &ctx) {
             copyable, "The fusible op should be copyable: " << op->op_name_);
     auto copied = copyable->copy(ins, outs, g);
     copied->info_.cur_impl_ = op->info_.cur_impl_;
-    COMPILE_ASSERT(copied->get_outputs().size() == 1,
-            "Currently only support 1 output only");
     g.make_output(outs);
     g.attrs_.set(mixed_partition_hint::single_op_graph, true);
     g.attrs_.set(mixed_partition_hint::optimized_sub_graph,
@@ -124,7 +122,7 @@ ir_module_ptr fusible_op_get_func(fusible_op_t *op, const context_ptr &ctx) {
             && try_optimize_parti(parti.get(), g, graph2orig_ops)) {
         // redo partition
         std::vector<mixed_parti_t::ptr> op2parti(g.ops_.size());
-        do_partition(ctx, g, op2parti);
+        do_partition(ctx, g, op2parti, std::make_shared<op_dep_matrix_t>(g));
         // collect legal partition
         auto res = collect_parti_set(op2parti, false);
         // Expect only one partition found
@@ -179,8 +177,14 @@ stmt mask_compute_func_t::operator()(const std::vector<expr> &in,
     if (cur_idx.defined() && upper_bound.defined()) {
         auto bld = builder::get_current_builder();
         bld->emit(ret);
-        return builder::make_assign_unattached(out[0],
-                make_select_by_mask(out[0], cur_idx, upper_bound, lanes));
+        const size_t len = out.size();
+        std::vector<stmt_c> cur_list;
+        cur_list.reserve(len);
+        for (size_t i = 0; i < len; i++) {
+            cur_list.emplace_back(builder::make_assign_unattached(out[i],
+                    make_select_by_mask(out[i], cur_idx, upper_bound, lanes)));
+        }
+        return builder::make_stmts_unattached(cur_list);
     }
     return ret;
 }
@@ -427,8 +431,8 @@ void compute_vectorized_op(const context_ptr &ctx, sc_graph_t &graph,
         sc_op_info_t &info, const vectorized_info_t &vx_info,
         const mask_compute_func_t &compute_lanes,
         const mask_compute_func_t &compute_scalar, any_map_t &attrs,
-        size_t wkld, bool use_mask, const tensor_slice *expand_loop_by,
-        bool unroll_inner_loop) {
+        const graph_tensor_ptr &expand_gt, size_t wkld, bool use_mask,
+        const tensor_slice *expand_loop_by, bool unroll_inner_loop) {
     if (!expand_loop_by) { expand_loop_by = &dst; }
     bool use_vectorized = false;
     vec_backend_require(ctx, use_vectorized);
@@ -552,6 +556,7 @@ void compute_vectorized_op(const context_ptr &ctx, sc_graph_t &graph,
                     if (unroll_inner_loop) {
                         cur->attr()[stmt_attr_key::unroll_loop] = 0;
                     }
+                    bind_loop_axis(expand_gt, cur, i, true);
                 }
                 tcur.emplace_back(cur);
             }
@@ -589,6 +594,7 @@ void compute_vectorized_op(const context_ptr &ctx, sc_graph_t &graph,
                 if (unroll_inner_loop) {
                     cur->attr()[stmt_attr_key::unroll_loop] = 0;
                 }
+                bind_loop_axis(expand_gt, cur, i, true);
                 tcur.emplace_back(cur);
             }
         } else if (iter_vars.at(i).isa<var>()) {
@@ -632,6 +638,7 @@ void compute_vectorized_op(const context_ptr &ctx, sc_graph_t &graph,
                     cur->attr()[stmt_attr_key::unroll_loop] = 0;
                 }
             }
+            bind_loop_axis(expand_gt, cur, i, true);
         }
     }
     if (!tcur.empty() && tcur[0].defined()) {
@@ -652,9 +659,9 @@ size_t get_dims_product(const sc_dims &dims) {
     sc_dim ret = 1;
     // todo: find out how to use this function in dynamic cases.
     for (unsigned i = 0; i < dims.size(); ++i) {
-        if (!is_dynamic_dim(dims[i]) && dims[i]) { ret *= dims[i]; }
+        if (!is_dynamic_dim(dims[i])) { ret *= dims[i]; }
     }
-    assert(ret > 0 && "Overflow or non-constant shape detected");
+    assert(ret >= 0 && "Overflow or non-constant shape detected");
     return ret;
 }
 
@@ -695,9 +702,9 @@ void set_unknown_input_slice(fusible_op_t *cur,
     }
 }
 
-std::unordered_map<int, bound_axis> search_known_input_axis(
-        sc_op *cur, bound_axis_map &bdax_map) {
-    std::unordered_map<int, bound_axis> known_axis_map;
+std::unordered_map<int, binding_axis> search_known_input_axis(
+        sc_op *cur, binding_axis_map &bdax_map) {
+    std::unordered_map<int, binding_axis> known_axis_map;
     auto input_size = cur->get_inputs().size();
     for (size_t i = 0; i < input_size; i++) {
         auto &input = cur->get_inputs()[i];
@@ -711,7 +718,7 @@ std::unordered_map<int, bound_axis> search_known_input_axis(
     return known_axis_map;
 }
 
-void call_output_user_axis_binding(sc_op *cur, bound_axis_map &bdax_map) {
+void call_output_user_axis_binding(sc_op *cur, binding_axis_map &bdax_map) {
     for (auto &out : cur->get_outputs()) {
         for (auto &user : out->uses_) {
             if (auto bd_op = user.second->dyn_cast<
@@ -723,8 +730,8 @@ void call_output_user_axis_binding(sc_op *cur, bound_axis_map &bdax_map) {
 }
 
 void set_unknown_binding_axis(sc_op *cur,
-        const std::unordered_map<int, bound_axis> &known_axis_map,
-        bound_axis_map &bdax_map) {
+        const std::unordered_map<int, binding_axis> &known_axis_map,
+        binding_axis_map &bdax_map) {
     // set other unknown axis.
     auto input_size = cur->get_inputs().size();
     for (size_t i = 0; i < input_size; i++) {

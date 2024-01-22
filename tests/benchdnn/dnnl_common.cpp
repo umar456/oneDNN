@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -46,6 +46,7 @@
 #include "dnnl_memory.hpp"
 
 #include "utils/cold_cache.hpp"
+#include "utils/fill.hpp"
 #include "utils/stream_kind.hpp"
 
 extern "C" dnnl_status_t dnnl_impl_notify_profiling_complete(
@@ -240,6 +241,9 @@ isa_hints_t hints {isa_hints_t::none};
 
 memory_kind_ext_t memory_kind {default_memory_kind};
 
+int default_num_streams = 1;
+int num_streams = default_num_streams;
+
 void init_isa_settings() {
     if (hints.get() == isa_hints_t::no_hints)
         DNN_SAFE_V(dnnl_set_cpu_isa_hints(dnnl_cpu_isa_no_hints));
@@ -429,58 +433,75 @@ inline int measure_perf_individual(timer::timer_t &t, dnnl_stream_t stream,
     return OK;
 }
 
-inline int measure_perf_aggregate(timer::timer_t &t, dnnl_stream_t stream,
-        perf_function_t &perf_func, std::vector<dnnl_exec_arg_t> &dnnl_args) {
+inline int measure_perf_aggregate(timer::timer_t &t,
+        const std::vector<stream_t> &v_stream, perf_function_t &perf_func,
+        std::vector<std::vector<dnnl_exec_arg_t>> &dnnl_args) {
     // There seems to be some limit to how many kernels can be queued in OCL
     // builds and 4096 seems to be a nice number under that limit.
     // Otherwise, hangs in perf validation are observed due to many kernels
     // being queued at once.
     static constexpr int max_batch_times = 4096;
 
-    // Warm-up run, this is not measured due to possibility the associated
-    // kernel has not been built and skews the results.
-    DNN_SAFE(perf_func(stream, dnnl_args), WARN);
-    DNN_SAFE(dnnl_stream_wait(stream), CRIT);
+    std::vector<cold_cache_t> cold_cache(num_streams);
 
-    cold_cache_t cold_cache(dnnl_args);
+    // Nvidia/AMD don't support profiling.
+    const bool use_profiling = is_gpu() && !is_nvidia_gpu() && !is_amd_gpu();
+
+    for (size_t j = 0; j < v_stream.size(); j++) {
+        // Warm-up run, this is not measured due to possibility the associated
+        // kernel has not been built and skews the results.
+        DNN_SAFE(perf_func(v_stream[j], dnnl_args[j]), WARN);
+        DNN_SAFE(dnnl_stream_wait(v_stream[j]), CRIT);
+        if (use_profiling) reset_gpu_profiling(v_stream[j]);
+        cold_cache[j] = cold_cache_t(dnnl_args[j]);
+    }
 
     bool is_first_loop = true;
     int cur_batch_times
             = fix_times_per_prb ? fix_times_per_prb : min_times_per_prb;
 
-    // Nvidia/AMD don't support profiling.
-    const bool use_profiling = is_gpu() && !is_nvidia_gpu() && !is_amd_gpu();
-    if (use_profiling) reset_gpu_profiling(stream);
-
     t.reset();
     while (true) {
-        for (int i = 0; i < cur_batch_times; i++) {
-            if (!cold_cache.update_dnnl_args(dnnl_args)) break;
-            DNN_SAFE(perf_func(stream, dnnl_args), WARN);
+        // Keep inner loop over streams for better submission overlapping.
+        for_(int i = 0; i < cur_batch_times; i++)
+        for (size_t j = 0; j < v_stream.size(); j++) {
+            if (!cold_cache[j].update_dnnl_args(dnnl_args[j])) break;
+            DNN_SAFE(perf_func(v_stream[j], dnnl_args[j]), WARN);
         }
-        DNN_SAFE(dnnl_stream_wait(stream), CRIT);
+
+        for (size_t j = 0; j < v_stream.size(); j++) {
+            DNN_SAFE(dnnl_stream_wait(v_stream[j]), CRIT);
+        }
 
         if (use_profiling) {
-            std::vector<uint64_t> nsecs;
-            std::vector<uint64_t> cycles;
-            get_gpu_profiling_info(stream, nsecs, cycles);
-            reset_gpu_profiling(stream);
+            std::vector<std::vector<uint64_t>> v_nsecs(num_streams);
+            std::vector<std::vector<uint64_t>> v_cycles(num_streams);
+            bool nsecs_is_empty = false;
+            for (size_t j = 0; j < v_stream.size(); j++) {
+                get_gpu_profiling_info(v_stream[j], v_nsecs[j], v_cycles[j]);
+                reset_gpu_profiling(v_stream[j]);
 
-            // Profiling should have information to report, otherwise, stop.
-            if (nsecs.empty()) {
-                BENCHDNN_PRINT(0, "%s\n",
-                        "WARNING: no counters were found during profiling.");
-                break;
+                // Profiling should have information to report, otherwise, stop.
+                if (v_nsecs[j].empty()) {
+                    nsecs_is_empty = true;
+                    BENCHDNN_PRINT(0, "%s\n",
+                            "WARNING: no counters were found during "
+                            "profiling.");
+                    break;
+                }
             }
+            if (nsecs_is_empty) break;
 
-            for (size_t i = 0; i < nsecs.size(); i++) {
-                t.stop(1, (int64_t)cycles[i], nsecs[i] / 1e6);
+            for_(size_t j = 0; j < v_stream.size(); j++)
+            for (size_t i = 0; i < v_nsecs[j].size(); i++) {
+                t.stop(1, (int64_t)v_cycles[j][i], v_nsecs[j][i] / 1e6);
             }
         } else {
-            t.stamp(cur_batch_times);
+            t.stamp(cur_batch_times * num_streams);
         }
 
-        if (should_stop(t) || cold_cache.should_stop()) break;
+        // Assumption that for each stream cold_cache acts same.
+        if (should_stop(t) || cold_cache[0].should_stop()) break;
 
         // Adjust cur_batch_times after the first batch run
         if (is_first_loop) {
@@ -496,7 +517,11 @@ inline int measure_perf_aggregate(timer::timer_t &t, dnnl_stream_t stream,
         }
     }
 
-    if (use_profiling) notify_gpu_profiling_complete(stream);
+    if (use_profiling) {
+        for (size_t j = 0; j < v_stream.size(); j++) {
+            notify_gpu_profiling_complete(v_stream[j]);
+        }
+    }
 
     return OK;
 }
@@ -506,10 +531,25 @@ int measure_perf(const thr_ctx_t &ctx, res_t *res, perf_function_t &perf_func,
     if (!has_bench_mode_bit(mode_bit_t::perf)) return OK;
 
     const auto &engine = get_test_engine();
-    stream_t stream(engine, ctx.get_interop_obj());
+    std::vector<stream_t> v_stream(num_streams);
+    for (int i = 0; i < num_streams; i++)
+        v_stream[i] = stream_t(engine, ctx.get_interop_obj());
 
-    std::vector<dnnl_exec_arg_t> dnnl_args;
-    execute_unmap_args(args, dnnl_args);
+    std::vector<std::vector<dnnl_exec_arg_t>> dnnl_args(num_streams);
+    std::vector<dnn_mem_map_t> mem_map(num_streams);
+    std::vector<args_t> v_args(num_streams);
+    v_args[0] = args;
+    for (int j = 1; j < num_streams; j++) {
+        for (int i = 0; i < args.size(); i++) {
+            int arg = args.arg(i);
+            const auto &m = args.dnn_mem(i);
+            mem_map[j].emplace(arg, dnn_mem_t(m.md_, engine));
+            mem_map[j].at(arg).reorder(m);
+        }
+        v_args[j] = args_t(mem_map[j]);
+        execute_unmap_args(v_args[j], dnnl_args[j]);
+    }
+    execute_unmap_args(args, dnnl_args[0]);
 
     auto &t = res->timer_map.perf_timer();
     // For non-DPCPP CPU: measure individual iterations.
@@ -517,15 +557,18 @@ int measure_perf(const thr_ctx_t &ctx, res_t *res, perf_function_t &perf_func,
     // overhead. DPCPP CPU follows the model of GPU, thus, handled similar.
     int ret = OK;
     if (is_cpu() && !is_sycl_engine(engine)) {
-        ret = execute_in_thr_ctx(
-                ctx, measure_perf_individual, t, stream, perf_func, dnnl_args);
+        ret = execute_in_thr_ctx(ctx, measure_perf_individual, t, v_stream[0],
+                perf_func, dnnl_args[0]);
     } else {
         ret = execute_in_thr_ctx(
-                ctx, measure_perf_aggregate, t, stream, perf_func, dnnl_args);
+                ctx, measure_perf_aggregate, t, v_stream, perf_func, dnnl_args);
     }
 
     if (ret != OK) res->state = FAILED;
     execute_map_args(args);
+    for (int j = 1; j < num_streams; j++) {
+        execute_map_args(v_args[j]);
+    }
 
     return ret;
 }
@@ -869,18 +912,18 @@ static int get_gpu_ram_sizes(size_t &ram_size, size_t &max_alloc_size) {
     return OK;
 }
 
-int get_cpu_cache_size(size_t &cache_size) {
+int get_cpu_cache_size(cpu_cache_args_t &cache_args) {
 #if DNNL_CPU_RUNTIME != DNNL_RUNTIME_NONE
     using namespace dnnl::impl::cpu::platform;
-    static const auto L2_size = get_per_core_cache_size(2);
-    static const auto L3_size = get_per_core_cache_size(3);
-    static const auto num_cores = get_num_cores();
-    static const auto total_cache_size = (L2_size + L3_size) * num_cores;
+    cache_args.L2_size = get_per_core_cache_size(2);
+    cache_args.L3_size = get_per_core_cache_size(3);
+    cache_args.num_cores = get_num_cores();
+    cache_args.total_socket_size
+            = (cache_args.L2_size + cache_args.L3_size) * cache_args.num_cores;
 #else
     // If functions are not available, just use 150 MiB.
-    static const auto total_cache_size = 150 * 1024 * 1024;
+    cache_args.total_socket_size = 150 * 1024 * 1024;
 #endif
-    cache_size = total_cache_size;
     return OK;
 }
 
@@ -1261,9 +1304,7 @@ engine_t::engine_t(dnnl_engine_kind_t engine_kind) : is_owner_(true) {
 
 engine_t::engine_t(dnnl_engine_t engine) : engine_(engine), is_owner_(false) {}
 
-engine_t::engine_t(const engine_t &other) {
-    is_owner_ = other.is_owner_;
-
+engine_t::engine_t(const engine_t &other) : is_owner_(other.is_owner_) {
     if (!is_owner_) {
         engine_ = other.engine_;
         return;
@@ -1305,7 +1346,7 @@ engine_t::~engine_t() {
     if (is_owner_) DNN_SAFE_V(dnnl_engine_destroy(engine_));
 }
 
-stream_t::stream_t(dnnl_engine_t engine, void *interop_obj) {
+stream_t::stream_t(dnnl_engine_t engine, void *interop_obj) : is_owner_(true) {
 #if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
     if (is_cpu(engine)) {
         auto tp = static_cast<dnnl::threadpool_interop::threadpool_iface *>(
@@ -1324,7 +1365,17 @@ stream_t::stream_t(dnnl_engine_t engine, void *interop_obj) {
 }
 
 stream_t::~stream_t() {
-    DNN_SAFE_V(dnnl_stream_destroy(stream_));
+    if (is_owner_) DNN_SAFE_V(dnnl_stream_destroy(stream_));
+}
+
+stream_t &stream_t::operator=(stream_t &&rhs) {
+    if (&rhs == this) return *this;
+
+    stream_ = rhs.stream_;
+    is_owner_ = rhs.is_owner_;
+
+    rhs.is_owner_ = false;
+    return *this;
 }
 
 float reorder_rescale_factor() {
@@ -1429,6 +1480,63 @@ int update_ref_mem_map_from_prim(dnnl_primitive_t prim_ref,
 
     if (!is_scratchpad) SAFE(prim_ref_mem.reorder(ref_mem, swapped_dt), WARN);
     ref_mem_map[exec_arg] = std::move(prim_ref_mem);
+
+    return OK;
+}
+
+// This function provides a general filling for atributes across all drivers.
+//
+// It provides a default filling config for both binary and prelu post-op.
+// The user has an option to override it by passing `fill_cfg_map` with
+// correspondent argument and attached `fill_cfg_t` object to it.
+// Default filling configs are simple to avoid floating-point rounding effects,
+// but not cancellation effects. For latter ones, it's the user's responsibility
+// to avoid them by supplying a proper fill_cfg for a given driver/problem.
+int init_ref_memory_args_default_case(int exec_arg, dnn_mem_t &mem,
+        dnn_mem_t &ref_mem, const attr_t &attr, res_t *res,
+        const std::unordered_map<int, fill_cfg_t> &fill_cfg_map) {
+    assert(exec_arg > 0); // Negative values will produce false-positive `true`.
+
+    const int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
+            - DNNL_ARG_ATTR_MULTIPLE_POST_OP(0);
+    const bool is_post_ops_arg = (exec_arg & post_ops_range);
+    const bool is_scales_arg = (exec_arg & DNNL_ARG_ATTR_SCALES);
+    const bool is_zero_point_arg = (exec_arg & DNNL_ARG_ATTR_ZERO_POINTS);
+
+    if (is_post_ops_arg) {
+        if (exec_arg & DNNL_ARG_SRC_1) {
+            const int bin_po_idx
+                    = exec_arg / DNNL_ARG_ATTR_MULTIPLE_POST_OP_BASE - 1;
+            assert(bin_po_idx < attr.post_ops.len());
+            const auto alg = attr.post_ops.entry[bin_po_idx].kind;
+            // Binary post-op filling.
+            fill_cfg_t def_binary_cfg(mem.dt(), -16.f, 16.f, /* int = */ true,
+                    alg, "def_binary_post_op");
+            const auto it = fill_cfg_map.find(DNNL_ARG_SRC_1);
+            const bool has_external_cfg = it != fill_cfg_map.end();
+            const fill_cfg_t &binary_fill_cfg
+                    = has_external_cfg ? (*it).second : def_binary_cfg;
+            TIME_FILL(SAFE(fill_random_real(mem, ref_mem, res, binary_fill_cfg),
+                    WARN));
+        } else if (exec_arg & DNNL_ARG_WEIGHTS) {
+            // Prelu post-op filling.
+            fill_cfg_t def_prelu_fill_cfg(mem.dt(), -2.f, 2.f, /* int = */ true,
+                    attr_t::post_ops_t::kind_t::PRELU, "def_prelu_post_op");
+            const auto it = fill_cfg_map.find(DNNL_ARG_WEIGHTS);
+            const bool has_external_cfg = it != fill_cfg_map.end();
+            const fill_cfg_t &prelu_fill_cfg
+                    = has_external_cfg ? (*it).second : def_prelu_fill_cfg;
+            TIME_FILL(SAFE(
+                    fill_random_real(mem, ref_mem, res, prelu_fill_cfg), WARN));
+        }
+    } else if (is_scales_arg) {
+        int local_exec_arg = exec_arg ^ DNNL_ARG_ATTR_SCALES;
+        TIME_FILL(SAFE(fill_scales(attr, local_exec_arg, mem, ref_mem), WARN));
+    } else if (is_zero_point_arg) {
+        int local_exec_arg = exec_arg ^ DNNL_ARG_ATTR_ZERO_POINTS;
+        TIME_FILL(SAFE(
+                fill_zero_points(attr, local_exec_arg, mem, ref_mem), WARN));
+    }
 
     return OK;
 }

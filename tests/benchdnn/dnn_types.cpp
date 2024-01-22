@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,8 +39,6 @@
 #include "utils/cold_cache.hpp"
 #include "utils/parser.hpp"
 #include "utils/stream_kind.hpp"
-
-#define BENCHDNN_DNNL_ARG_UNDEF 0
 
 namespace tag {
 const char *x {"x"};
@@ -753,8 +751,8 @@ std::ostream &dump_global_params(std::ostream &s) {
         if (engine_index != 0) s << ":" << engine_index;
         s << " ";
     }
-    if (canonical || fast_ref_gpu != true)
-        s << "--fast-ref-gpu=" << bool2str(fast_ref_gpu) << " ";
+    if (canonical || fast_ref != default_fast_ref)
+        s << "--fast-ref=" << bool2str(fast_ref) << " ";
     if (!skip_impl.empty()) s << "--skip-impl=" << skip_impl << " ";
     if (canonical || mem_check != true)
         s << "--mem-check=" << bool2str(mem_check) << " ";

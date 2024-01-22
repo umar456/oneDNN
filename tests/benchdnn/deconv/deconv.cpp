@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,9 +25,7 @@
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
 
-#include "binary/binary.hpp"
 #include "deconv/deconv.hpp"
-#include "prelu/prelu.hpp"
 
 namespace deconv {
 
@@ -285,9 +283,14 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     return dnnl_success;
 }
 
-int init_prim_ref(
-        benchdnn_dnnl_wrapper_t<dnnl_primitive_t> &prim_ref, const prb_t *prb) {
-    if (!(has_bench_mode_bit(mode_bit_t::corr) && is_gpu() && fast_ref_gpu))
+int init_prim_ref(benchdnn_dnnl_wrapper_t<dnnl_primitive_t> &prim_ref,
+        const prb_t *prb, res_t *res) {
+    if (!(has_bench_mode_bit(mode_bit_t::corr) && fast_ref)) return OK;
+    // Create prim_ref if only original prim was successfully created.
+    if (res->state != INITIALIZED) return OK;
+
+    // f32 cases should go through reference no matter what.
+    if (is_cpu() && (prb->src_dt() == dnnl_f32 && prb->wei_dt() == dnnl_f32))
         return OK;
 
     // Create a new copy of prb to avoid potentially corrupting the test by
@@ -296,25 +299,38 @@ int init_prim_ref(
     // reference implementation.
     auto cpu_attr = prb->attr;
     update_cpu_ref_attrs(cpu_attr);
-    prb_t prb_cpu {*prb, prb->dir, {dnnl_f32}, tag::abx, tag::abx, tag::abx,
-            DIRECT, cpu_attr, prb->ctx_init, prb->ctx_exe, prb->mb};
-
-    init_pd_args_t<prb_t> init_pd_args(
-            /* res = */ nullptr, get_cpu_engine(), &prb_cpu, prb->dir,
-            /* hint = */ nullptr, /* src_md = */ nullptr);
-    init_pd(init_pd_args);
-
-    benchdnn_dnnl_wrapper_t<dnnl_primitive_desc_t> pdw;
-    fetch_impl(pdw, init_pd_args, /* res = */ nullptr,
-            /* is_service_prim = */ true);
-
+    std::vector<std::vector<dnnl_data_type_t>> prim_ref_dt {
+            prb->dt, {dnnl_f32}};
+    if (is_cpu()) prim_ref_dt.erase(prim_ref_dt.begin());
     dnnl_primitive_t prim_ref_ {};
-    if (pdw) {
-        if (query_impl_info(pdw) == "ref:any") return OK;
-        DNN_SAFE(dnnl_primitive_create(&prim_ref_, pdw), WARN);
-        BENCHDNN_PRINT(5, "CPU reference oneDNN implementation: %s\n",
-                query_impl_info(pdw).c_str());
+
+    for (const auto &prim_ref_dt_i : prim_ref_dt) {
+        prb_t prb_cpu {*prb, prb->dir, prim_ref_dt_i, tag::any, tag::any,
+                tag::any, DIRECT, cpu_attr, prb->ctx_init, prb->ctx_exe,
+                prb->mb};
+
+        init_pd_args_t<prb_t> init_pd_args(
+                /* res = */ nullptr, get_cpu_engine(), &prb_cpu, prb->dir,
+                /* hint = */ nullptr, /* src_md = */ nullptr);
+        init_pd(init_pd_args);
+
+        benchdnn_dnnl_wrapper_t<dnnl_primitive_desc_t> pdw;
+        fetch_impl(pdw, init_pd_args, /* res = */ nullptr,
+                /* is_service_prim = */ true);
+
+        if (pdw) {
+            if (query_impl_info(pdw) == "ref:any") return OK;
+
+            auto st = dnnl_primitive_create(&prim_ref_, pdw);
+            if (st != dnnl_success) continue;
+
+            BENCHDNN_PRINT(5, "CPU reference oneDNN implementation: %s\n",
+                    query_impl_info(pdw).c_str());
+            res->prim_ref_repro = prb_cpu.str();
+            break;
+        }
     }
+
     prim_ref.reset(prim_ref_);
     return OK;
 }
@@ -400,8 +416,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         const int exec_arg = entry.first;
         auto &mem = entry.second; // `mem` is modified by filler (reorder).
 
-        ref_mem_map.emplace(
-                exec_arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        // Scratchpad memory relates to a primitive. If reference needs it,
+        // use switch below to define a memory desc for it.
+        if (exec_arg != DNNL_ARG_SCRATCHPAD) {
+            ref_mem_map.emplace(exec_arg,
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        }
         auto &ref_mem = ref_mem_map[exec_arg];
 
         switch (exec_arg) {
@@ -452,29 +472,11 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                 ref_mem_map.emplace(DNNL_ARG_DIFF_WEIGHTS_1,
                         dnn_mem_t(wei_tr_md, ref_engine));
             } break;
-            default: { // Process all attributes here
-                int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
-                        - DNNL_ARG_ATTR_MULTIPLE_POST_OP(0);
-                bool is_post_ops_arg = (exec_arg & post_ops_range);
-                bool is_scales_arg = (exec_arg & DNNL_ARG_ATTR_SCALES);
-                bool is_zero_point_arg = (exec_arg & DNNL_ARG_ATTR_ZERO_POINTS);
-
-                if (is_post_ops_arg) {
-                    if (exec_arg & DNNL_ARG_SRC_1)
-                        SAFE(binary::fill_mem(exec_arg, mem, ref_mem), WARN);
-                    else if (exec_arg & DNNL_ARG_WEIGHTS)
-                        SAFE(prelu::fill_data(WEI, mem, ref_mem), WARN);
-                } else if (is_scales_arg) {
-                    int local_exec_arg = exec_arg ^ DNNL_ARG_ATTR_SCALES;
-                    SAFE(fill_scales(prb->attr, local_exec_arg, mem, ref_mem),
-                            WARN);
-                } else if (is_zero_point_arg) {
-                    int local_exec_arg = exec_arg ^ DNNL_ARG_ATTR_ZERO_POINTS;
-                    SAFE(fill_zero_points(
-                                 prb->attr, local_exec_arg, mem, ref_mem),
-                            WARN);
-                }
-            } break;
+            default:
+                SAFE(init_ref_memory_args_default_case(
+                             exec_arg, mem, ref_mem, prb->attr, res),
+                        WARN);
+                break;
         }
 
         update_ref_mem_map_from_prim(prim_ref, mem, ref_mem_map, exec_arg,
@@ -508,7 +510,7 @@ int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     v_prim.resize(2); // regular + cpu_ref
     SAFE(init_prim(prb->ctx_init, v_prim[0], init_pd, prb, res), WARN);
     // Use CPU prim as the reference in GPU testing to reduce testing time.
-    SAFE(init_prim_ref(v_prim[1], prb), WARN);
+    SAFE(init_prim_ref(v_prim[1], prb, res), WARN);
     return OK;
 }
 
@@ -535,10 +537,8 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     SAFE(execute_and_wait(prim, args, res), WARN);
 
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
-        check_correctness(prb, get_kinds_to_check(prb), args, ref_args,
-                setup_cmp, res, prim_ref);
-    }
+    check_correctness(prb, get_kinds_to_check(prb), args, ref_args, setup_cmp,
+            res, prim_ref);
 
     return measure_perf(prb->ctx_exe, res, prim, args);
 }

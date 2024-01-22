@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -219,11 +219,25 @@ void fusible_op_t::commit_into_anchor(fusion_anchor_t *committed_anchor) {
     std::vector<std::vector<tensor_slice>> inputs(in_tsrs.size()),
             outputs(out_tsrs.size());
     auto ths = this;
-    auto wrap_tsr2tsl_ = [&ths](const expr &tsr,
-                                 const slice_range_list &range_list,
+    auto wrap_tsr2tsl_ = [&ths, &committed_anchor](const expr &tsr,
+                                 const graph_tensor_ptr &gt,
                                  bool is_output = false) {
+        auto &range_list = committed_anchor->fsmap_.get(gt);
         std::vector<tensor_slice> multi_tsl;
         if (!range_list.empty()) {
+            if (ths->isa<reorder_op_t>() && is_output) {
+                auto input_size
+                        = committed_anchor->fsmap_.get(ths->get_inputs()[0])
+                                  .size();
+                // multi-slice reorder
+                if (input_size && range_list.size() > input_size) {
+                    // align output size with input
+                    for (size_t i = 0; i < input_size; i++) {
+                        multi_tsl.emplace_back(tensor_slice(tsr));
+                    }
+                    return multi_tsl;
+                }
+            }
             for (auto &range : range_list) {
                 multi_tsl.emplace_back(tensor_slice(tsr, slice_range(range)));
             }
@@ -233,6 +247,15 @@ void fusible_op_t::commit_into_anchor(fusion_anchor_t *committed_anchor) {
                             << ths->op_name_)
             if (is_output) {
                 ths->attrs_.set(op_attr_key::break_post_fuse, true);
+            } else if (committed_anchor->isa<grouped_fusion_anchor_t>()) {
+                // pre-fuse reorder, align input size with output
+                auto output_size
+                        = committed_anchor->fsmap_.get(ths->get_outputs()[0])
+                                  .size();
+                for (size_t i = 0; i < output_size; i++) {
+                    multi_tsl.emplace_back(tensor_slice(tsr));
+                }
+                return multi_tsl;
             }
             multi_tsl.emplace_back(tensor_slice(tsr));
         }
@@ -240,16 +263,13 @@ void fusible_op_t::commit_into_anchor(fusion_anchor_t *committed_anchor) {
     };
     std::transform(get_inputs().begin(), get_inputs().end(), in_tsrs.begin(),
             inputs.begin(),
-            [&wrap_tsr2tsl_, &committed_anchor](
-                    const graph_tensor_ptr &gt, const expr &tsr) {
-                return wrap_tsr2tsl_(tsr, committed_anchor->fsmap_.get(gt));
+            [&wrap_tsr2tsl_](const graph_tensor_ptr &gt, const expr &tsr) {
+                return wrap_tsr2tsl_(tsr, gt);
             });
     std::transform(get_outputs().begin(), get_outputs().end(), out_tsrs.begin(),
             outputs.begin(),
-            [&wrap_tsr2tsl_, &committed_anchor](
-                    const graph_tensor_ptr &gt, const expr &tsr) {
-                return wrap_tsr2tsl_(
-                        tsr, committed_anchor->fsmap_.get(gt), true);
+            [&wrap_tsr2tsl_](const graph_tensor_ptr &gt, const expr &tsr) {
+                return wrap_tsr2tsl_(tsr, gt, true);
             });
     auto in_slice_size = inputs[0].size();
     COMPILE_ASSERT(in_slice_size, "No input slice found for " << op_name_)

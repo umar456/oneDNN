@@ -24,6 +24,26 @@ namespace impl {
 namespace gpu {
 namespace jit {
 
+const std::vector<prb_dim_t> &conv_dims() {
+    static std::vector<prb_dim_t> _conv_dims = []() {
+        std::vector<prb_dim_t> ret;
+        for (auto &d : conv_index_dims(prop_kind::forward)) {
+            ret.push_back(d);
+        }
+        ret.push_back(prb_dims::id);
+        ret.push_back(prb_dims::ih);
+        ret.push_back(prb_dims::iw);
+        for (auto &d : conv_stride_dims())
+            ret.push_back(d);
+        for (auto &d : conv_dilation_dims())
+            ret.push_back(d);
+        for (auto &d : conv_padding_dims())
+            ret.push_back(d);
+        return ret;
+    }();
+    return _conv_dims;
+}
+
 const std::vector<prb_dim_t> &conv_index_dims(prop_kind_t prop) {
     auto get_dims = [&](prop_kind_t prop) {
         std::vector<prb_dim_t> ret;
@@ -247,7 +267,7 @@ void conv_problem_t::init_transpose(const hw_t &hw) {
                         || fpmath_mode == dnnl_fpmath_mode_tf32)
                     && osp % 8 == 0);
     bool allow_bwd_d
-            = !is_bwd_d || (a_data_type == data_type::f32 && osp == isp);
+            = !is_bwd_d || (wei_data_type == data_type::f32 && osp == isp);
     bool allow_fwd = !is_fwd
             || (dst_data_type != data_type::f32
                     && dst_data_type != data_type::f64 && mb <= 8 && ih != iw
@@ -258,8 +278,7 @@ void conv_problem_t::init_transpose(const hw_t &hw) {
             = gpu_utils::dev_getenv("ab_swap_transpose", ab_swap_transpose);
 }
 
-prb_dim_t to_gemm(const prb_dim_t &d, const conv_problem_t &prb) {
-    const auto prop = prb.prop_kind();
+prb_dim_t to_gemm(const prb_dim_t &d, prop_kind_t prop, bool is_transpose) {
     const bool is_fwd = (prop == prop_kind::forward);
     const bool is_bwd_d = (prop == prop_kind::backward_data);
     const bool is_bwd_w = (prop == prop_kind::backward_weights);
@@ -272,7 +291,7 @@ prb_dim_t to_gemm(const prb_dim_t &d, const conv_problem_t &prb) {
     };
     auto pick = [&](const prb_dim_t &fwd, const prb_dim_t &bwd_d,
                         const prb_dim_t &bwd_w) {
-        if (prb.ab_swap_transpose) {
+        if (is_transpose) {
             if (is_fwd) return transpose_gemm(fwd);
             if (is_bwd_d) return transpose_gemm(bwd_d);
             if (is_bwd_w) return transpose_gemm(bwd_w);
@@ -307,14 +326,14 @@ prb_dim_t to_gemm(const prb_dim_t &d, const conv_problem_t &prb) {
     }
 }
 
-prb_tile_t to_gemm(const prb_tile_t &t, const conv_problem_t &prb) {
+prb_tile_t to_gemm(const prb_tile_t &t, prop_kind_t prop, bool is_transpose) {
     prb_tile_t ret;
     ret[prb_dims::b] = 1;
     ret[prb_dims::m] = 1;
     ret[prb_dims::n] = 1;
     ret[prb_dims::k] = 1;
     for (auto &d : t) {
-        auto gemm_d = to_gemm(d, prb);
+        auto gemm_d = to_gemm(d, prop, is_transpose);
         if (gemm_d.is_undef()) continue;
         ret[gemm_d] *= t[d];
     }

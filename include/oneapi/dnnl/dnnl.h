@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -293,6 +293,24 @@ dnnl_status_t DNNL_API dnnl_primitive_attr_get_fpmath_mode(
 ///     otherwise.
 dnnl_status_t DNNL_API dnnl_primitive_attr_set_fpmath_mode(
         dnnl_primitive_attr_t attr, dnnl_fpmath_mode_t mode);
+
+/// Returns the deterministic primitive attribute value.
+///
+/// @param attr Primitive attributes.
+/// @param value Output deterministic attribute value
+/// @returns #dnnl_success on success and a status describing the error
+///     otherwise.
+dnnl_status_t DNNL_API dnnl_primitive_attr_get_deterministic(
+        const_dnnl_primitive_attr_t attr, int *value);
+
+/// Sets the deterministic primitive attribute value.
+///
+/// @param attr Primitive attributes.
+/// @param value Boolean value to set deterministic attribute
+/// @returns #dnnl_success on success and a status describing the error
+///     otherwise.
+dnnl_status_t DNNL_API dnnl_primitive_attr_set_deterministic(
+        dnnl_primitive_attr_t attr, int value);
 
 /// Returns the accumulation mode primitive attribute.
 ///
@@ -2152,6 +2170,83 @@ dnnl_status_t DNNL_API dnnl_layer_normalization_backward_primitive_desc_create(
         const_dnnl_memory_desc_t diff_dst_desc,
         const_dnnl_memory_desc_t src_desc, const_dnnl_memory_desc_t stat_desc,
         float epsilon, unsigned flags, const_dnnl_primitive_desc_t hint_fwd_pd,
+        const_dnnl_primitive_attr_t attr);
+
+/// Creates a primitive descriptor for a layer normalization forward propagation
+///     primitive with a user-provided data type for the scale and shift
+///     memory objects.
+///
+/// @note
+///     In-place operation is supported: the dst can refer to the same memory
+///     as the src.
+///
+/// @param primitive_desc Output primitive_descriptor.
+/// @param engine Engine to use.
+/// @param prop_kind Propagation kind. Possible values are
+///     #dnnl_forward_training and #dnnl_forward_inference.
+/// @param src_desc Source memory descriptor.
+/// @param dst_desc Destination memory descriptor.
+/// @param stat_desc Memory descriptor for mean and variance. If this
+///     parameter is NULL, a zero memory descriptor, or a memory descriptor
+///     with format_kind set to #dnnl_format_kind_undef, then the memory
+///     descriptor for stats is derived from @p src_desc by removing the last
+///     dimension.
+/// @param scale_shift_data_type Data type of scale and shift memory. If neither scale
+///     nor shift flag are specified the parameter is ignored.
+/// @param epsilon Layer normalization epsilon parameter.
+/// @param flags Layer normalization flags (@ref dnnl_normalization_flags_t).
+/// @param attr Primitive attributes (can be NULL).
+/// @returns #dnnl_success on success and a status describing the error
+///     otherwise.
+dnnl_status_t DNNL_API
+dnnl_layer_normalization_forward_primitive_desc_create_v2(
+        dnnl_primitive_desc_t *primitive_desc, dnnl_engine_t engine,
+        dnnl_prop_kind_t prop_kind, const_dnnl_memory_desc_t src_desc,
+        const_dnnl_memory_desc_t dst_desc, const_dnnl_memory_desc_t stat_desc,
+        dnnl_data_type_t scale_shift_data_type, float epsilon, unsigned flags,
+        const_dnnl_primitive_attr_t attr);
+
+/// Creates a primitive descriptor for a layer normalization backward
+///     propagation primitive with a user-provided data type for the
+///     scale and shift memory objects.
+///
+/// @note
+///     In-place operation is supported: the diff_dst can refer to the same
+///     memory as the diff_src.
+///
+/// @param primitive_desc Output primitive_descriptor.
+/// @param engine Engine to use.
+/// @param prop_kind Propagation kind. Possible values are
+///     #dnnl_backward_data and #dnnl_backward (diffs for all parameters are
+///     computed in this case).
+/// @param diff_src_desc Diff source memory descriptor.
+/// @param diff_dst_desc Diff destination memory descriptor.
+/// @param src_desc Source memory descriptor.
+/// @param stat_desc Memory descriptor for mean and variance. If this
+///     parameter is NULL, a zero memory descriptor, or a memory descriptor
+///     with format_kind set to #dnnl_format_kind_undef, then the memory
+///     descriptor for stats is derived from @p src_desc by removing the last
+///     dimension.
+/// @param diff_scale_shift_data_type Data type of diff scale and shift memory. If neither scale
+///     nor shift flag are specified the parameter is ignored.
+/// @param scale_shift_data_type Data type of scale and shift memory. If neither scale
+///     nor shift flag are specified the parameter is ignored.
+/// @param epsilon Layer normalization epsilon parameter.
+/// @param flags Layer normalization flags (@ref dnnl_normalization_flags_t).
+/// @param hint_fwd_pd Primitive descriptor for a respective forward propagation
+///     primitive.
+/// @param attr Primitive attributes (can be NULL).
+/// @returns #dnnl_success on success and a status describing the error
+///     otherwise.
+dnnl_status_t DNNL_API
+dnnl_layer_normalization_backward_primitive_desc_create_v2(
+        dnnl_primitive_desc_t *primitive_desc, dnnl_engine_t engine,
+        dnnl_prop_kind_t prop_kind, const_dnnl_memory_desc_t diff_src_desc,
+        const_dnnl_memory_desc_t diff_dst_desc,
+        const_dnnl_memory_desc_t src_desc, const_dnnl_memory_desc_t stat_desc,
+        dnnl_data_type_t diff_scale_shift_data_type,
+        dnnl_data_type_t scale_shift_data_type, float epsilon, unsigned flags,
+        const_dnnl_primitive_desc_t hint_fwd_pd,
         const_dnnl_primitive_attr_t attr);
 
 /// @} dnnl_api_layer_normalization

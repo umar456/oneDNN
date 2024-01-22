@@ -117,6 +117,12 @@ struct block_t {
     block_t(dim_t dim_idx, dim_t block, const stride_t &stride)
         : dim_idx(dim_idx), block(block), stride(stride) {}
 
+    bool can_merge(const block_t &other, bool same_dim_only = true) const {
+        bool dim_ok = !same_dim_only || (dim_idx == other.dim_idx);
+        bool is_dense = (stride * block == other.stride);
+        return dim_ok && is_dense;
+    }
+
 #if __cplusplus >= 202002L
     // Enabling default operator== on C++20 for validation purposes.
     bool operator==(const block_t &) const = default;
@@ -134,7 +140,7 @@ struct block_t {
         std::ostringstream oss;
         oss << "block_t(dim_idx = " << dim_idx;
         oss << ", block = " << block;
-        oss << ", stride = " << stride;
+        oss << ", stride = " << stride.str();
         oss << ")";
         return oss.str();
     }
@@ -219,6 +225,15 @@ struct block_layout_t {
     block_t &operator[](size_t idx) {
         assert(idx < num_blocks);
         return blocks[idx];
+    }
+
+    std::string str() const {
+        std::ostringstream ss;
+        for (size_t i = 0; i < num_blocks; i++) {
+            const auto &block = blocks[i];
+            ss << block.str() << " ";
+        }
+        return ss.str();
     }
 
     block_layout_t normalized(bool remove_size_1_blocks = true) const;

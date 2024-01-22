@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -252,6 +252,7 @@ void padding_op_t::compute_block(context_ptr ctx,
                         ? expr(step)
                         : expr(1),
                 std::move(body), true, for_type::NORMAL);
+        bind_loop_axis(get_inputs()[0], cur, i, true);
     }
 
     bld->emit(cur);
@@ -304,6 +305,7 @@ stmt padding_op_t::get_zero_out_stmt(
     const auto pads_begin = attrs_.get<sc_dims>("pads_begin");
     const auto pads_end = attrs_.get<sc_dims>("pads_end");
     auto out_tptr = out_tsl.tptr_;
+    auto padding_value = attrs_.get_or_else("padding_value", 0);
 
     if (plain_ndims_ == 2) {
         // Note: padding on the first dim (km) for 2D.
@@ -315,12 +317,12 @@ stmt padding_op_t::get_zero_out_stmt(
         builder::ir_builder_t bld;
         bld.push_scope();
         if (pt > 0) {
-            builtin::mem_zero(
-                    builder::tensor_ptr(out_tptr, {0, 0}), pt * nm, out_dtype);
+            builtin::brgemm_init(builder::tensor_ptr(out_tptr, {0, 0}), pt, nm,
+                    nm, out_dtype, padding_value);
         }
         if (pb > 0) {
-            builtin::mem_zero(builder::tensor_ptr(out_tptr, {km - pb, 0}),
-                    pb * nm, out_dtype);
+            builtin::brgemm_init(builder::tensor_ptr(out_tptr, {km - pb, 0}),
+                    pb, nm, nm, out_dtype, padding_value);
         }
         auto ret = bld.pop_scope();
         return ret;
@@ -337,7 +339,8 @@ stmt padding_op_t::get_zero_out_stmt(
         auto is_4d_out = ndims == 4;
 
         for (size_t i = real_padding_axis.back() + 1; i < ndims; i++) {
-            c *= get_expr_as_int(out->dims_[i]);
+            c *= range_list.empty() ? get_expr_as_int(out->dims_[i])
+                                    : get_expr_as_int(range[i].second);
         }
 
         // input plain format must be NCHW in conv_fwd_core
@@ -368,12 +371,13 @@ stmt padding_op_t::get_zero_out_stmt(
                                                        {pad_n, pad_k, 0, 0}))
                             : builder::tensor_ptr(
                                     out_tptr, {pad_n, pad_k, 0, 0, 0});
-                    builtin::mem_zero(ptr, ph1_ * ow * c, out_dtype);
+                    builtin::brgemm_init(
+                            ptr, ph1_ * ow, c, c, out_dtype, padding_value);
                 }
 
                 _for_(p1, 0, ih) {
                     if (pw1_ > 0) {
-                        builtin::mem_zero(
+                        builtin::brgemm_init(
                                 is_4d_out ? (is_channel_last
                                                 ? builder::tensor_ptr(out_tptr,
                                                         {pad_n, p1 + ph1_, 0,
@@ -384,12 +388,11 @@ stmt padding_op_t::get_zero_out_stmt(
                                           : builder::tensor_ptr(out_tptr,
                                                   {pad_n, pad_k, p1 + ph1_, 0,
                                                           0}),
-
-                                pw1_ * c, out_dtype);
+                                pw1_, c, c, out_dtype, padding_value);
                     }
 
                     if (pw2_ > 0) {
-                        builtin::mem_zero(
+                        builtin::brgemm_init(
                                 is_4d_out ? (is_channel_last
                                                 ? builder::tensor_ptr(out_tptr,
                                                         {pad_n, p1 + ph1_,
@@ -404,13 +407,12 @@ stmt padding_op_t::get_zero_out_stmt(
                                           : builder::tensor_ptr(out_tptr,
                                                   {pad_n, pad_k, p1 + ph1_,
                                                           iw + pw1_, 0}),
-
-                                pw2_ * c, out_dtype);
+                                pw2_, c, c, out_dtype, padding_value);
                     }
                 }
 
                 if (ph2_ > 0) {
-                    builtin::mem_zero(
+                    builtin::brgemm_init(
                             is_4d_out ? (is_channel_last
                                             ? builder::tensor_ptr(out_tptr,
                                                     {pad_n, ph1_ + ih, 0, 0})
@@ -418,8 +420,8 @@ stmt padding_op_t::get_zero_out_stmt(
                                                     {pad_n, pad_k, ph1_ + ih,
                                                             0}))
                                       : builder::tensor_ptr(out_tptr,
-                                              {pad_n, pad_k, ph1_ + ih, 0}),
-                            ph2_ * ow * c, out_dtype);
+                                              {pad_n, pad_k, ph1_ + ih, 0, 0}),
+                            ph2_ * ow, c, c, out_dtype, padding_value);
                 }
             }
         }

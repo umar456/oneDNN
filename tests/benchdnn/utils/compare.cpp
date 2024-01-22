@@ -226,6 +226,14 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
     res->total += nelems;
 
     dnn_mem_t got_f32(got_mem, dnnl_f32, tag::abx, get_cpu_engine());
+    dnn_mem_t exp_f32_plain;
+    if (has_prim_ref_
+            && !check_md_consistency_with_tag(exp_mem.md_, tag::abx)) {
+        exp_f32_plain
+                = dnn_mem_t(exp_mem, dnnl_f32, tag::abx, get_cpu_engine());
+    }
+    const dnn_mem_t &exp_f32 = exp_f32_plain ? exp_f32_plain : exp_mem;
+
     const auto dt = got_mem.dt();
     const bool has_eltwise
             = attr.post_ops.eltwise_index() != -1 || has_eltwise_post_op_;
@@ -264,7 +272,7 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
         static thread_local float ithr_max_rdiff = 0.f;
         static thread_local float ithr_max_diff = 0.f;
 
-        driver_check_func_args_t args(exp_mem, got_f32, i, dt, trh_);
+        driver_check_func_args_t args(exp_f32, got_f32, i, dt, trh_);
 
         bool ok = args.diff == 0.f;
         if (std::isnan(args.exp_f32) && is_integral_dt(dt)) {
@@ -333,6 +341,11 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
             // may result in sporadic order of operations. This may cause a
             // difference around `x.5f` value, and can be rounded either way to
             // `x` or `x + 1` which can't be fixed by filling.
+            //
+            // Another class of `off-by-1` issues coming from optimized
+            // reference when transcendental operation present in the chain. In
+            // such cases, there's no way to test original output as both
+            // outputs would be rounded to integer number.
             const auto is_int8_round_good = [args]() -> bool {
                 // Check that original value is close to x.5f.
                 static constexpr float small_eps = 9e-6f;
@@ -349,7 +362,15 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
                 }
                 return false;
             };
-            ok = is_integral_dt(args.dt) && is_int8_round_good();
+            const auto is_int8_prim_ref_and_transcedental = [&]() -> bool {
+                if (!has_prim_ref_) return false;
+                if (fabsf(args.exp_f32 - args.got) != 1) return false;
+                // TODO: update with transcendental eltwise ops only.
+                return has_eltwise;
+            };
+            ok = is_integral_dt(args.dt)
+                    && (is_int8_round_good()
+                            || is_int8_prim_ref_and_transcedental());
             if (ok) break;
 
             // Nvidia backend with fpmath mode enabled returns not exact output
@@ -440,8 +461,9 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
 
 int compare_t::compare(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
         const attr_t &attr, res_t *res) const {
-    std::string add_args = std::string(use_norm_ ? "use_norm:true" : "")
-            + std::string(op_output_has_nans_ ? "has_nans:true" : "");
+    std::string add_args = std::string(use_norm_ ? "use_norm:true;" : "")
+            + std::string(op_output_has_nans_ ? "has_nans:true;" : "")
+            + std::string(has_prim_ref_ ? "has_prim_ref:true;" : "");
     BENCHDNN_PRINT(6, "[COMPARE]%s: zero_trust%%=%.2f%% extra=%s\n",
             get_kind_str().c_str(), zero_trust_percent_, add_args.c_str());
     if (use_norm_) return compare_norm(exp_mem, got_mem, attr, res);

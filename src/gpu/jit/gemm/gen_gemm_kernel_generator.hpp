@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@
 /* Embargo support */
 
 #define STANDALONE 0
+
+#include <bitset>
 
 #include "common/math_utils.hpp"
 #include "common/utils.hpp"
@@ -68,6 +70,7 @@ public:
         s32 = 0x01890402,
         u64 = 0x018A0803,
         s64 = 0x018B0803,
+        bf8 = 0x010E0100,
         bf16 = 0x010C0201,
         tf32 = 0x010D0402,
     };
@@ -122,7 +125,7 @@ public:
                 DataType::df, DataType::invalid, DataType::ub, DataType::b,
                 DataType::uw, DataType::w, DataType::ud, DataType::d,
                 DataType::uq, DataType::q, DataType::bf, DataType::tf32,
-                DataType::invalid, DataType::invalid};
+                DataType::bf8, DataType::invalid};
         return table[(uint32_t(val) >> 16) & 0xF];
     }
 
@@ -244,6 +247,9 @@ enum RemainderOptions : uint8_t {
     AllowDescriptors
     = 2, // Allow indirect send descriptor-based remainder handling.
     AllowFragDesc = 3, // Allow fragmentation and descriptors.
+    NoFixedMasks = 4, // Do not allow fixed masks.
+    AllowFragDescNFM
+    = 7, // Allow fragmentation and descriptors, but no fixed masks
 };
 
 // Preferences for using scattered accesses.
@@ -841,7 +847,7 @@ enum class COffset {
 enum class BatchMode { None, Strided, Nonstrided, Variable };
 
 // Binary operations.
-enum class BinaryOp { Add, Sub, Mul, Div, Min, Max };
+enum class BinaryOp { Add, Sub, Mul, Div, Min, Max, Prelu };
 
 // GEMM kernel problem description.
 struct GEMMProblem : public CommonProblem {
@@ -862,18 +868,20 @@ struct GEMMProblem : public CommonProblem {
          sumB
             = false; // If true, calculate A row sums/B column sums and store in CO.
     bool postOpFwd = true; // Eltwise parameters
-    bool postOpTranspose = false; // If true, binary srcs have been transposed
 
     post_ops_t postOps; // Fused post operations to apply
+    std::bitset<post_ops_t::post_ops_limit>
+            binaryRow; // Binary-op broadcasts row data on false
+    std::bitset<post_ops_t::post_ops_limit>
+            binaryCol; // Binary-op broadcasts column data on false;
+    std::bitset<post_ops_t::post_ops_limit> binaryBatch;
+    std::bitset<post_ops_t::post_ops_limit>
+            binaryTrans; // Used to compute GEMMProblem::binary
 
     // The following data is derived from the postOps and does not need
     // considered for equality/hashing purposes
     std::vector<MatrixAddressing> binary; // Binary postop data
     std::vector<Type> Tbinary; // Binary types
-    std::vector<bool> binaryRow; // Dimensionality of binary data
-    std::vector<bool>
-            binaryCol; //    (false means broadcast in the given dimension)
-    std::vector<bool> binaryBatch;
 
     bool hasPostOp() const { return postOps.len() > 0; }
     bool hasNonSum1PostOp() const {
@@ -883,7 +891,9 @@ struct GEMMProblem : public CommonProblem {
     }
     bool hasBinaryPostOp() const {
         for (int idx = 0; idx < postOps.len(); idx++)
-            if (postOps.entry_[idx].is_binary()) return true;
+            if (postOps.entry_[idx].is_binary()
+                    || postOps.entry_[idx].is_prelu())
+                return true;
         return false;
     }
     bool hasSum1PostOpAtEnd() const {
@@ -933,8 +943,11 @@ struct GEMMProblem : public CommonProblem {
         s.append(batchDims);
         s.append(sumA, sumB);
         s.append(postOpFwd);
-        s.append(postOpTranspose);
         s.append(postOps);
+        s.append(binaryRow);
+        s.append(binaryCol);
+        s.append(binaryBatch);
+        s.append(binaryTrans);
     }
 };
 
@@ -1230,6 +1243,7 @@ struct GEMMStrategy : public GEMMStrategyPOD {
         return 64 * (int(fuseBeta) + int(fusePostOps));
     }
     bool needsTempC(const GEMMProblem &problem) const;
+    bool nondeterministic(const GEMMProblem &problem) const;
 
     bool checkAdd32Rem() const { return checkAdd32 && emulate.emulate64; }
 
@@ -2337,7 +2351,8 @@ protected:
     void gemmBetaScale(const GEMMProblem &problem, const GEMMStrategy &strategy,
             GEMMState &state);
     void binaryOp(BinaryOp op, int simd, const ngen::RegData &dst,
-            const ngen::RegData &src0, const ngen::RegData &src1);
+            const ngen::RegData &src0, const ngen::RegData &src1,
+            GEMMState &state);
     void gemmScalarBinaryOpC(BinaryOp op, const ngen::Subregister &offset,
             const GEMMProblem &problem, const GEMMStrategy &strategy,
             GEMMState &state);
@@ -2771,6 +2786,7 @@ protected:
 inline char precisionChar(Type T) {
     switch (T.baseType()) {
         case Type::f16: return 'H';
+        case Type::bf8: return 'Q';
         case Type::f32: return 'S';
         case Type::u8: return 'o';
         case Type::s8: return 'O';
@@ -2789,6 +2805,7 @@ inline char precisionChar(Type T) {
 static inline Type charPrecision(char c) {
     switch (c) {
         case 'H': return Type::f16;
+        case 'Q': return Type::bf8;
         case 'S': return Type::f32;
         case 'o': return Type::u8;
         case 'O': return Type::s8;

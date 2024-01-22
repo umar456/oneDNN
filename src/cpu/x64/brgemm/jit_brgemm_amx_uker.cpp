@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -51,15 +51,17 @@ struct jit_brgemm_amx_uker_base_t : public jit_generator {
             // so we don't need to preserve vmm
             static constexpr bool preserve_vmm = false;
             static constexpr bool use_exact_tail_scalar_bcast = false;
-            const auto dst_md_wrapper = memory_desc_wrapper(brg.dst_md);
+            const auto dst_md_wrapper = memory_desc_wrapper(brg.dst_md());
 
             static const bcast_set_t enabled_bcast_strategy
                     = {broadcasting_strategy_t::scalar,
                             broadcasting_strategy_t::per_oc,
                             broadcasting_strategy_t::per_oc_spatial,
+                            broadcasting_strategy_t::per_mb,
                             broadcasting_strategy_t::per_mb_spatial,
                             broadcasting_strategy_t::per_mb_w,
                             broadcasting_strategy_t::per_w,
+                            broadcasting_strategy_t::batch,
                             broadcasting_strategy_t::no_broadcast};
             const binary_injector::rhs_arg_static_params_t rhs_sp {
                     static_cast<size_t>(Xbyak::Zmm(1).getIdx()), this->r14,
@@ -75,23 +77,27 @@ struct jit_brgemm_amx_uker_base_t : public jit_generator {
             esp.preserve_p_table = false;
 
             postops_injector_ = utils::make_unique<po_injector_t>(
-                    this, brg.attr->post_ops_, bsp, esp);
+                    this, brg.attr()->post_ops_, bsp, esp);
 
             using namespace dnnl::impl::cpu::binary_injector_utils;
             std::tie(with_binary_per_oc_bcast_, with_binary_per_oc_sp_bcast_,
-                    with_binary_channel_bcast_, with_binary_per_mb_w_bcast_,
-                    with_binary_per_w_bcast_, with_binary_no_bcast_)
-                    = bcast_strategies_present_tup(brg.attr->post_ops_.entry_,
+                    with_binary_per_mb_bcast_, with_binary_channel_bcast_,
+                    with_binary_per_mb_w_bcast_, with_binary_per_w_bcast_,
+                    with_binary_batch_bcast_, with_binary_no_bcast_)
+                    = bcast_strategies_present_tup(brg.attr()->post_ops_.entry_,
                             dst_md_wrapper, broadcasting_strategy_t::per_oc,
                             broadcasting_strategy_t::per_oc_spatial,
+                            broadcasting_strategy_t::per_mb,
                             broadcasting_strategy_t::per_mb_spatial,
                             broadcasting_strategy_t::per_mb_w,
                             broadcasting_strategy_t::per_w,
+                            broadcasting_strategy_t::batch,
                             broadcasting_strategy_t::no_broadcast);
             handle_binary_po_offset_ = with_binary_per_oc_bcast_
-                    || with_binary_per_oc_sp_bcast_
+                    || with_binary_per_oc_sp_bcast_ || with_binary_per_mb_bcast_
                     || with_binary_channel_bcast_ || with_binary_per_mb_w_bcast_
-                    || with_binary_per_w_bcast_ || with_binary_no_bcast_;
+                    || with_binary_per_w_bcast_ || with_binary_batch_bcast_
+                    || with_binary_no_bcast_;
         }
         use_ils_ = brg.brgattr.use_interleave_stores;
     }
@@ -165,8 +171,10 @@ private:
     bool with_binary_per_oc_bcast_ = false;
     bool with_binary_per_oc_sp_bcast_ = false;
     bool with_binary_channel_bcast_ = false;
+    bool with_binary_per_mb_bcast_ = false;
     bool with_binary_per_mb_w_bcast_ = false;
     bool with_binary_per_w_bcast_ = false;
+    bool with_binary_batch_bcast_ = false;
     bool with_binary_no_bcast_ = false;
     bool prepare_post_ops_registers_once_ = false;
 
@@ -2477,9 +2485,8 @@ void jit_brgemm_amx_uker_base_t::generate() {
     }
 }
 
-brgemm_amx_uker_t::brgemm_amx_uker_t(const brgemm_t abrd) {
-    brgemm_kernel_ = new jit_brgemm_amx_uker_base_t(abrd);
-}
+brgemm_amx_uker_t::brgemm_amx_uker_t(const brgemm_t &abrd)
+    : brgemm_kernel_(new jit_brgemm_amx_uker_base_t(abrd)) {}
 
 status_t brgemm_amx_uker_t::create_kernel() {
     return brgemm_kernel_->create_kernel();

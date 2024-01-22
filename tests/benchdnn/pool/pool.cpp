@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 * Copyright 2022-2023 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,7 +27,6 @@
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
 
-#include "binary/binary.hpp"
 #include "pool/pool.hpp"
 
 namespace pool {
@@ -181,7 +180,8 @@ bool cuda_check_correctness(const prb_t *prb,
 void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
         const args_t &ref_args) {
     // Threshold to compensate division error. CPU could live with 6.f coeff.
-    const float trh = 10.f * epsilon_dt(prb->dt[1]);
+    const float trh
+            = prb->alg == alg_t::max ? 0.f : 10.f * epsilon_dt(prb->dt[1]);
     cmp.set_threshold(trh);
     // Backward may have most zeroes for ker_in_pad with huge kernels problems.
     const float zero_percent = (prb->dir & FLAG_FWD) ? 99.f : 100.f;
@@ -215,6 +215,26 @@ std::vector<int> supported_exec_args(dir_t dir) {
     return (dir & FLAG_FWD) ? exec_fwd_args : exec_bwd_args;
 };
 
+fill_cfg_t binary_po_fill_cfg(
+        int exec_arg, const dnn_mem_t &mem, const attr_t &attr) {
+    fill_cfg_t cfg;
+    const int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
+            - DNNL_ARG_ATTR_MULTIPLE_POST_OP(0);
+    const bool is_post_ops_arg = (exec_arg & post_ops_range);
+    if (is_post_ops_arg) {
+        // Config secures only positive values since average pooling output is
+        // positive, and using negative values leads to the cancellation
+        // effect.
+        const int bin_po_idx
+                = exec_arg / DNNL_ARG_ATTR_MULTIPLE_POST_OP_BASE - 1;
+        assert(bin_po_idx < attr.post_ops.len());
+        const auto alg = attr.post_ops.entry[bin_po_idx].kind;
+        cfg = fill_cfg_t(mem.dt(), 0.f, 16.f, /* int = */ true, alg,
+                "pooling_binary_post_op");
+    }
+    return cfg;
+}
+
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         dnnl_primitive_t prim, const prb_t *prb, res_t *res, dir_t dir,
         dnnl_primitive_t prim_ref) {
@@ -229,8 +249,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         const int exec_arg = entry.first;
         auto &mem = entry.second; // `mem` is modified by filler (reorder).
 
-        ref_mem_map.emplace(
-                exec_arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        // Scratchpad memory relates to a primitive. If reference needs it,
+        // use switch below to define a memory desc for it.
+        if (exec_arg != DNNL_ARG_SCRATCHPAD && exec_arg != DNNL_ARG_WORKSPACE) {
+            ref_mem_map.emplace(exec_arg,
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        }
         auto &ref_mem = ref_mem_map[exec_arg];
 
         switch (exec_arg) {
@@ -251,21 +275,32 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
             case DNNL_ARG_DST:
                 SAFE(!check_md_consistency_with_tag(mem.md_, prb->tag), WARN);
                 break;
-            case DNNL_ARG_SCRATCHPAD: break;
-            default: { // Process all attributes here
-                int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
-                        - DNNL_ARG_ATTR_MULTIPLE_POST_OP(0);
-                bool is_post_ops_arg = (exec_arg & post_ops_range);
-                if (is_post_ops_arg) {
-                    SAFE(binary::fill_mem(exec_arg, mem, ref_mem), WARN);
-                }
-            } break;
+            default:
+                const auto &binary_fill_cfg
+                        = binary_po_fill_cfg(exec_arg, mem, prb->attr);
+                std::unordered_map<int, fill_cfg_t> fill_cfg_map {
+                        {DNNL_ARG_SRC_1, binary_fill_cfg}};
+                SAFE(init_ref_memory_args_default_case(exec_arg, mem, ref_mem,
+                             prb->attr, res, fill_cfg_map),
+                        WARN);
+                break;
         }
         // Don't keep reference memory if it is not used further.
         if (!has_bench_mode_bit(mode_bit_t::corr)) ref_mem_map.clear();
     }
 
     return OK;
+}
+
+std::vector<data_kind_t> get_kinds_to_check(const prb_t *prb, dir_t dir) {
+    std::vector<data_kind_t> check_kinds;
+    if ((prb->dir & FLAG_FWD) && (dir & FLAG_FWD)) {
+        check_kinds = {DST};
+    } else if ((prb->dir & FLAG_BWD) && (dir & FLAG_BWD)) {
+        check_kinds = {SRC};
+    }
+    // `check_kinds` is empty for `(prb->dir & FLAG_BWD) && (dir & FLAG_FWD)`.
+    return check_kinds;
 }
 
 int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
@@ -306,11 +341,8 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     if (bench_mode != bench_mode_t::init)
         SAFE(execute_and_wait(v_prim[0], args, res), WARN);
 
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
-        if (prb->dir & FLAG_FWD) {
-            check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
-        }
-    }
+    check_correctness(prb, get_kinds_to_check(prb, FLAG_FWD), args, ref_args,
+            setup_cmp, res);
 
     if (prb->dir & FLAG_BWD) {
         // Pass same memory map as we need data from forward on backward.
@@ -325,9 +357,8 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
         SAFE(execute_and_wait(v_prim[1], args, res), WARN);
 
-        if (has_bench_mode_bit(mode_bit_t::corr)) {
-            check_correctness(prb, {SRC}, args, ref_args, setup_cmp, res);
-        }
+        check_correctness(prb, get_kinds_to_check(prb, FLAG_BWD), args,
+                ref_args, setup_cmp, res);
     }
 
     return measure_perf(prb->ctx_exe, res, prim, args);

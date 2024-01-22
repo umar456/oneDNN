@@ -70,15 +70,15 @@ public:
         bool do_alloc = (obj.kind == alloc_kind_t::grf);
         bool use_bc_alloc = false;
         if (do_alloc) {
-            int grf_size = ngen::GRF::bytes(hw);
+            const int max_ngen_type_bits = 64;
             reg_buf_data_t rbd;
             if (obj.has_attr<bank_conflict_attr_t>()) {
                 rbd = create_bank_conflict_allocation(obj);
                 use_bc_alloc = true;
-            } else if (obj.size < grf_size) {
+            } else if (obj.size * 8 <= max_ngen_type_bits) {
                 rbd = scope.alloc_reg_data(type_t::u(obj.size * 8));
             } else {
-                int regs = utils::div_up(obj.size, grf_size);
+                const int regs = utils::div_up(obj.size, ngen::GRF::bytes(hw));
                 rbd = scope.alloc_reg_buf(regs);
             }
             if (obj.has_attr<grf_permute_attr_t>()) {
@@ -513,9 +513,10 @@ private:
         int grf_size = ngen::GRF::bytes(hw);
         int step = 2 * grf_size;
         for (int i = 0; i < size; i += step) {
-            int exec_size = std::min(step, size - i) / type.size();
+            step = std::min(step, size - i);
+            step = utils::rnd_down_pow2(step);
+            int exec_size = step / type.size();
             auto sub_rd_mov = rd.format(i, to_ngen(type), exec_size).reg_data();
-            ir_assert(math::is_pow2(exec_size));
             host_->emov(exec_size, sub_rd_mov, ngen::Immediate(0.0f));
         }
     }

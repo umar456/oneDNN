@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -54,6 +54,7 @@ struct gen_gemm_kernel_desc_t {
             case Type::u32: return compute::scalar_type_t::_uint;
             case Type::s64: return compute::scalar_type_t::_long;
             case Type::u64: return compute::scalar_type_t::_ulong;
+            case Type::bf8: return compute::scalar_type_t::_bfloat8;
             case Type::bf16: return compute::scalar_type_t::_bfloat16;
             case Type::f16: return compute::scalar_type_t::_half;
             case Type::f32: return compute::scalar_type_t::_float;
@@ -84,6 +85,7 @@ protected:
             case data_type::f32: return Type::f32;
             case data_type::f16: return Type::f16;
             case data_type::bf16: return Type::bf16;
+            case data_type::f8_e5m2: return Type::bf8;
             case data_type::s32: return Type::s32;
             case data_type::u8: return Type::u8;
             case data_type::s8: return Type::s8;
@@ -117,15 +119,24 @@ protected:
     int eu_count_ = -1;
     bool disable_systolic_ = false;
 
-    status_t transfer_post_ops(
-            const post_ops_t &post_ops, bool swap_ab = false);
+    status_t transfer_post_ops(const post_ops_t &post_ops, bool swap_ab,
+            const memory_desc_t &prelu_wei_md);
 
     status_t finalize();
     void update_driver_info();
 };
 
 struct gen_gemm_nocopy_kernel_desc_t : public gen_gemm_kernel_desc_t {
-    enum compute_mode { mode_default = 0, mode_tf32 = 0x1, mode_bf16x1 = 0x2 };
+    enum compute_mode {
+        mode_default = 0,
+        mode_tf32 = 0x1,
+        mode_bf16x1 = 0x2,
+        mode_deterministic = 0x8000
+    };
+
+    friend void set_mode(compute_mode &mode, compute_mode flag) {
+        mode = static_cast<compute_mode>(mode | flag);
+    }
 
     status_t select_kernel(compute::gpu_arch_t arch, int stepping, int eu_count,
             bool has_systolic, compute_mode mode, int batch_dims, bool trans_a,
@@ -135,7 +146,7 @@ struct gen_gemm_nocopy_kernel_desc_t : public gen_gemm_kernel_desc_t {
             data_type_t a_type, data_type_t b_type, data_type_t c_type,
             data_type_t co_type, data_type_t acc_type, int align_a, int align_b,
             int align_c, dim_t m, dim_t n, dim_t k, dim_t lda, dim_t ldb,
-            dim_t ldc, dim_t batch);
+            dim_t ldc, dim_t batch, const memory_desc_t &prelu_wei_md);
 };
 
 struct gen_gemm_xe_systolic_kernel_desc_t : public gen_gemm_kernel_desc_t {
@@ -145,7 +156,7 @@ struct gen_gemm_xe_systolic_kernel_desc_t : public gen_gemm_kernel_desc_t {
             const post_ops_t &post_ops, data_type_t a_type, data_type_t b_type,
             data_type_t c_type, data_type_t co_type, data_type_t acc_type,
             dim_t m, dim_t n, dim_t k, dim_t batch, int unroll_m, int unroll_n,
-            bool alt);
+            bool alt, const memory_desc_t &prelu_wei_md);
 
     static void choose_unrolls(compute::gpu_arch_t arch, int eu_count,
             data_type_t a_type, data_type_t b_type, data_type_t c_type, dim_t m,

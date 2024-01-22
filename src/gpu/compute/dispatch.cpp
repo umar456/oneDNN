@@ -181,12 +181,13 @@ void dispatch_t::def_kernel_macros(kernel_ctx_t &kernel_ctx) const {
                 utils::format("%s_STRIDE%d", gws_prefix.c_str(), i),
                 get_gws_stride(i));
 
-        bool is_zero = (dims_[i].size == 1);
+        bool is_zero = dims_[i].size <= 1;
+        bool is_zero_stride = get_gws_stride(i) == 0;
         bool is_outermost = (i == ndims_ - 1)
                 || dims_[i + 1].gws_index != dims_[i].gws_index;
-        const char *op_name = is_zero ? "GWS_OP_ZERO"
-                : is_outermost        ? "GWS_OP_FIRST"
-                                      : "GWS_OP_MOD";
+        const char *op_name = is_zero || is_zero_stride ? "GWS_OP_ZERO"
+                : is_outermost                          ? "GWS_OP_FIRST"
+                                                        : "GWS_OP_MOD";
         kernel_ctx.add_option(
                 utils::format("-D%s_OP%d=%s", gws_prefix.c_str(), i, op_name));
         kernel_ctx.define_int(utils::format("%s_DIM%d", gws_prefix.c_str(), i),
@@ -201,10 +202,10 @@ void dispatch_t::def_kernel_macros(kernel_ctx_t &kernel_ctx) const {
 
     // Local work size and subgroup sizes.
     int vec_dim_idx = find_vectorized_dim();
-    kernel_ctx.define_int(
-            utils::format("GWS_WITH_SG_%s", attr_suffix_), vec_dim_idx != -1);
+    kernel_ctx.define_int(utils::format("GWS_WITH_SG_%s", attr_suffix_),
+            vec_dim_idx != dim_not_found);
 
-    if (vec_dim_idx != -1)
+    if (vec_dim_idx != dim_not_found)
         kernel_ctx.define_int(utils::format("GWS_SGS_%s", attr_suffix_),
                 dims_[vec_dim_idx].vector_size);
 
@@ -239,7 +240,7 @@ void dispatch_t::generate(bool generate_lws) {
 
     // Compute GWS indices.
     for (int i = 0; i < ndims_; ++i) {
-        if (vec_dim_idx == -1) {
+        if (vec_dim_idx == dim_not_found) {
             // Keep up to 4 dims in gws[0] to have bigger choice for work group
             // size.
             dims_[i].gws_index = std::min(2, std::max(0, i - 3));
@@ -278,7 +279,7 @@ void dispatch_t::generate(bool generate_lws) {
     // Handle a vectorized dimension (if presented).
     size_t lws[3] = {1, 1, 1};
     bool with_lws = false;
-    if (vec_dim_idx != -1) {
+    if (vec_dim_idx != dim_not_found) {
         int gws_index = dims_[vec_dim_idx].gws_index;
         int vec_size = dims_[vec_dim_idx].vector_size;
         int nblocks = dims_[vec_dim_idx].size / dims_[vec_dim_idx].block;

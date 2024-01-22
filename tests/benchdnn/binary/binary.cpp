@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -32,9 +32,7 @@
 
 namespace binary {
 
-//TODO: Consider filling with powers of 2 for division to avoid rounding errors
-int fill_mem(int input_idx, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp,
-        bool only_positive_values, bool only_integer_values) {
+int fill_mem(int input_idx, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
     const auto nelems = mem_fp.nelems();
     if (nelems == 0) return OK;
 
@@ -44,9 +42,8 @@ int fill_mem(int input_idx, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp,
 
     benchdnn_parallel_nd(nelems, [&](int64_t i) {
         const int64_t gen = (12 * i + 5 * input_idx + 16) % (range + 1);
-        const float scale = only_integer_values ? 1.f : 1.25f;
+        const float scale = 1.25f;
         float value = (f_min + gen) * scale;
-        if (only_positive_values) value = fabs(value);
         // Remove zeroes in src1 to avoid division by zero
         if (input_idx == 1 && value == 0.0f) value = 1.0f;
         mem_fp.set_elem(i, round_to_nearest_representable(dt, value));
@@ -185,8 +182,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         const int exec_arg = entry.first;
         auto &mem = entry.second; // `mem` is modified by filler (reorder).
 
-        ref_mem_map.emplace(
-                exec_arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        // Scratchpad memory relates to a primitive. If reference needs it,
+        // use switch below to define a memory desc for it.
+        if (exec_arg != DNNL_ARG_SCRATCHPAD) {
+            ref_mem_map.emplace(exec_arg,
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        }
         auto &ref_mem = ref_mem_map[exec_arg];
 
         switch (exec_arg) {
@@ -197,22 +198,11 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                     SAFE(fill_mem(2, mem, ref_mem), WARN);
                 }
                 break;
-            case DNNL_ARG_SCRATCHPAD: break;
-            default: { // Process all attributes here
-                int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
-                        - DNNL_ARG_ATTR_MULTIPLE_POST_OP(0);
-                bool is_post_ops_arg = (exec_arg & post_ops_range);
-                bool is_scales_arg = (exec_arg & DNNL_ARG_ATTR_SCALES);
-                if (is_post_ops_arg) {
-                    SAFE(binary::fill_mem(exec_arg, mem, ref_mem), WARN);
-                } else if (is_scales_arg) {
-                    int exec_src_arg = exec_arg ^ DNNL_ARG_ATTR_SCALES;
-                    // Leave hard coded until supported mask is 0 only.
-                    ref_mem.set_elem(
-                            0, prb->attr.scales.get(exec_src_arg).scale);
-                    SAFE(mem.reorder(ref_mem), WARN);
-                }
-            } break;
+            default:
+                SAFE(init_ref_memory_args_default_case(
+                             exec_arg, mem, ref_mem, prb->attr, res),
+                        WARN);
+                break;
         }
         // Don't keep reference memory if it is not used further.
         if (!has_bench_mode_bit(mode_bit_t::corr)) ref_mem_map.clear();
@@ -248,9 +238,7 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     SAFE(execute_and_wait(prim, args, res), WARN);
 
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
-        check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
-    }
+    check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
 
     return measure_perf(prb->ctx_exe, res, prim, args);
 }

@@ -15,9 +15,12 @@
  *******************************************************************************/
 #include "convolution.hpp"
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
+#include "fusible/memory_movement.hpp"
+#include "fusible/padding.hpp"
 #include "templates/conv1x1_backprop_data.hpp"
 #include "templates/conv1x1_backprop_weight.hpp"
 #include "templates/convNxN_backprop_data.hpp"
@@ -34,6 +37,7 @@
 #include <compiler/ir/graph/fusible_op_utils.hpp>
 #include <compiler/ir/graph/mixed_partition.hpp>
 #include <compiler/ir/graph/pass/pass.hpp>
+#include <compiler/ir/graph/quantization/quantize_info.hpp>
 #include <compiler/ir/graph/tunable_op.hpp>
 #include <compiler/ir/graph/utils.hpp>
 #include <compiler/ir/transform/loop_transform.hpp>
@@ -83,7 +87,26 @@ infer_status_code conv_fwd_core_op_t::infer_slice_ranges(
     int C_block = 1;
     int K_block = 1;
     int tile_p = 1;
+
     const auto use_rl = attrs_.get_or_else("use_rl", ops::rl_kind::NO_LOWERING);
+    auto inp_plain_dim = get_inputs()[0]->details_.get_plain_dims();
+    auto inp_plain_size = get_inputs()[0]->details_.get_plain_dims().size();
+    auto wei_plain_dim = use_rl != ops::rl_kind::NO_LOWERING
+            ? attrs_.get<sc_dims>("origin_wei_plain_dims")
+            : get_inputs()[1]->details_.get_plain_dims();
+    auto wei_plain_size = wei_plain_dim.size();
+
+    sc_dim groups = attrs_.get_or_else("groups", 1);
+    COMPILE_ASSERT(groups == 1
+                    || (inp_plain_dim.size() >= 5 && wei_plain_dim.size() >= 5
+                            && groups == inp_plain_dim[1]
+                            && groups == wei_plain_dim[0]),
+            "Group conv format should be NGCX and GOIX");
+    bool is_dw_brdgmm = (groups > 1) && (1 == inp_plain_dim[2])
+            && (1 == wei_plain_dim[1]);
+
+    // TODO(Zhicong): Add the infer slice range support for NGCHW like layout
+    if (groups > 1) { return infer_status_code::FAIL; }
 
     if (config_data_) {
         if (use_nested_conv_fwd_generator()) {
@@ -94,6 +117,10 @@ infer_status_code conv_fwd_core_op_t::infer_slice_ranges(
             const conv_fwd_rl_config_t &tcfg
                     = *config_data_.get_as<conv_fwd_rl_config_t>();
             tile_p = tcfg.brgemm_m;
+        } else if (is_dw_brdgmm) {
+            const conv_dw_fwd_config_t &tcfg
+                    = *config_data_.get_as<conv_dw_fwd_config_t>();
+            tile_p = tcfg.im_h_block;
         } else {
             const conv_fwd_config_t &tcfg
                     = *config_data_.get_as<conv_fwd_config_t>();
@@ -105,12 +132,7 @@ infer_status_code conv_fwd_core_op_t::infer_slice_ranges(
     if (known_ranges_map[0].empty() && known_ranges_map[1].empty()) {
         return infer_status_code::RETRY;
     }
-    auto inp_plain_size = get_inputs()[0]->details_.get_plain_dims().size();
-    auto wei_plain_dim = use_rl != ops::rl_kind::NO_LOWERING
-            ? attrs_.get<sc_dims>("origin_wei_plain_dims")
-            : get_inputs()[1]->details_.get_plain_dims();
 
-    auto wei_plain_size = wei_plain_dim.size();
     auto inp_dims = get_inputs()[0]->details_.get_blocking_dims(),
          wei_dims = get_inputs()[1]->details_.get_blocking_dims(),
          out_dims = get_outputs()[0]->details_.get_blocking_dims();
@@ -278,10 +300,42 @@ infer_status_code conv_fwd_core_op_t::infer_slice_ranges(
     return infer_status_code::OK;
 }
 
+static sc_dims parse_NGCX_to_NCX(const sc_dims &shape) {
+    auto ret_shape = sc_dims(shape.size() - 1, 0);
+    ret_shape[0] = shape[0];
+    ret_shape[1] = shape[1] * shape[2];
+    for (auto i = 3UL; i < shape.size(); i++) {
+        ret_shape[i - 1] = shape[i];
+    }
+    return ret_shape;
+}
+
+static sc_dims parse_GOIX_to_OIX(const sc_dims &shape) {
+    auto ret_shape = sc_dims(shape.size() - 1, 0);
+    ret_shape[0] = shape[0] * shape[1];
+    for (auto i = 2UL; i < shape.size(); i++) {
+        ret_shape[i - 1] = shape[i];
+    }
+    return ret_shape;
+}
+
+static sc_dims parse_NCX_to_NGCX(const sc_dims &shape, int groups) {
+    size_t ndims = shape.size();
+    auto NCX_shape = shape;
+    auto ret_shape = sc_dims(ndims + 1, 0);
+    ret_shape[0] = NCX_shape[0]; // N
+    ret_shape[1] = groups; //  G
+    ret_shape[2] = NCX_shape[1] / groups; // IC
+    for (auto i = 2UL; i < ndims; i++) {
+        ret_shape[i + 1] = NCX_shape[i];
+    }
+    return ret_shape;
+}
+
 void conv_fwd_core_op_t::infer_out_tensor_details() {
     if (!info_.outputs_[0]->details_.get_plain_dims().empty()) return;
     auto &cur_plain_dims = info_.outputs_[0]->details_.get_plain_dims();
-    auto &indims = info_.inputs_[0]->details_.get_plain_dims();
+    auto indims = info_.inputs_[0]->details_.get_plain_dims();
     auto weightdims = info_.inputs_[1]->details_.get_plain_dims();
     if (attrs_.get_or_else("use_rl", ops::rl_kind::NO_LOWERING)
             != ops::rl_kind::NO_LOWERING) {
@@ -294,9 +348,18 @@ void conv_fwd_core_op_t::infer_out_tensor_details() {
     auto &pads_end = attrs_.has_key("pads_end")
             ? attrs_.get<sc_dims>("pads_end")
             : attrs_.get<sc_dims>("paddings");
+    auto groups = attrs_.get_or_else("groups", 1);
+    if (groups > 1) {
+        indims = parse_NGCX_to_NCX(indims);
+        weightdims = parse_GOIX_to_OIX(weightdims);
+    }
+
     auto expected_out_shape = infer_out_dims(get_owner_graph(), indims,
             weightdims, pads_begin, pads_end, attrs_.get<sc_dims>("strides"),
             get_dilations(attrs_), attrs_);
+    if (groups > 1) {
+        expected_out_shape = parse_NCX_to_NGCX(expected_out_shape, groups);
+    }
     if (!cur_plain_dims.empty() && !is_dynamic()) {
         COMPILE_ASSERT(info_.outputs_[0]->details_.get_plain_dims()
                         == expected_out_shape,
@@ -413,34 +476,38 @@ sc_dims conv_fwd_core_op_t::infer_out_dims(sc_graph_t &owner_graph,
 void conv_fwd_core_op_t::infer_auto_pad(sc_graph_t &owner_graph,
         const sc_dims &input_dims, const sc_dims &weight_dims,
         const sc_dims &stride, const sc_dims &dilation, any_map_t &attrs,
-        bool is_same_upper) {
+        bool is_same_upper, bool is_NGCX_layout) {
     int ndims = input_dims.size();
-    sc_dims stride_dims(ndims - 2, stride[0]);
+    sc_dims stride_dims(ndims - 2 - is_NGCX_layout, stride[0]);
     if (stride.size() > 1) { stride_dims = stride; }
-    sc_dims dilation_dims(ndims - 2, dilation[0]);
+    sc_dims dilation_dims(ndims - 2 - is_NGCX_layout, dilation[0]);
     if (dilation.size() > 1) { dilation_dims = dilation; }
-    sc_dims pads_begin(ndims - 2, 0);
-    sc_dims pads_end(ndims - 2, 0);
+    sc_dims pads_begin(ndims - 2 - is_NGCX_layout, 0);
+    sc_dims pads_end(ndims - 2 - is_NGCX_layout, 0);
     auto calc_total_padding = [](int i, int k, int o, int s, int d) {
         return std::max((o - 1) * s + (d * (k - 1) + 1) - i, 0);
     };
-    for (int i = 2; i < ndims; ++i) {
+    for (int i = 2 + is_NGCX_layout; i < ndims; ++i) {
         if (is_dynamic_dim(input_dims[i]) || is_dynamic_dim(weight_dims[i])
-                || is_dynamic_dim(stride_dims[i - 2])) {
+                || is_dynamic_dim(stride_dims[i - 2 - is_NGCX_layout])) {
             // pads_begin not necessarily equal to pads_end
-            pads_begin[i - 2] = owner_graph.get_next_dynamic_placeholder();
-            pads_end[i - 2] = owner_graph.get_next_dynamic_placeholder();
+            pads_begin[i - 2 - is_NGCX_layout]
+                    = owner_graph.get_next_dynamic_placeholder();
+            pads_end[i - 2 - is_NGCX_layout]
+                    = owner_graph.get_next_dynamic_placeholder();
         } else {
-            sc_dim output_dim
-                    = utils::divide_and_ceil(input_dims[i], stride_dims[i - 2]);
+            sc_dim output_dim = utils::divide_and_ceil(
+                    input_dims[i], stride_dims[i - 2 - is_NGCX_layout]);
             sc_dim total_pad = calc_total_padding(input_dims[i], weight_dims[i],
-                    output_dim, stride_dims[i - 2], dilation_dims[i - 2]);
+                    output_dim, stride_dims[i - 2 - is_NGCX_layout],
+                    dilation_dims[i - 2 - is_NGCX_layout]);
             if (total_pad % 2 == 0) {
-                pads_begin[i - 2] = pads_end[i - 2] = total_pad / 2;
+                pads_begin[i - 2 - is_NGCX_layout]
+                        = pads_end[i - 2 - is_NGCX_layout] = total_pad / 2;
             } else {
-                pads_begin[i - 2]
+                pads_begin[i - 2 - is_NGCX_layout]
                         = is_same_upper ? total_pad / 2 : total_pad / 2 + 1;
-                pads_end[i - 2]
+                pads_end[i - 2 - is_NGCX_layout]
                         = is_same_upper ? total_pad / 2 + 1 : total_pad / 2;
             }
         }
@@ -491,18 +558,21 @@ conv_fwd_core_op_t::conv_fwd_core_op_t(const std::vector<graph_tensor_ptr> &ins,
     ndims_ = indims.size();
     auto strides = attrs_.get<sc_dims>("strides");
     auto dilations = get_dilations(attrs_);
+    sc_dim groups = attrs_.get_or_else("groups", 1);
     // processing padding info
     // if auto_pad is set, original pads_begin/pads_end values will be omitted
     // so we directly overwrite attrs_
     if (attrs_.has_key("auto_pad")) {
         auto pad_type = attrs_.get<std::string>("auto_pad");
         if (pad_type == "VALID") {
-            attrs_.set<sc_dims>("pads_begin", sc_dims(ndims_ - 2, 0));
-            attrs_.set<sc_dims>("pads_end", sc_dims(ndims_ - 2, 0));
+            attrs_.set<sc_dims>(
+                    "pads_begin", sc_dims(ndims_ - 2 - (groups > 1), 0));
+            attrs_.set<sc_dims>(
+                    "pads_end", sc_dims(ndims_ - 2 - (groups > 1), 0));
         } else if (pad_type == "SAME_UPPER" || pad_type == "SAME_LOWER") {
             // output spatial dims are equal to input spatial dims
             infer_auto_pad(get_owner_graph(), indims, weightdims, strides,
-                    dilations, attrs_, pad_type == "SAME_UPPER");
+                    dilations, attrs_, pad_type == "SAME_UPPER", groups > 1);
         }
         attrs_.set<std::string>("auto_pad", "none");
     }
@@ -516,16 +586,13 @@ conv_fwd_core_op_t::conv_fwd_core_op_t(const std::vector<graph_tensor_ptr> &ins,
         pads_begin = attrs_.get<sc_dims>("paddings");
         pads_end = pads_begin;
     }
-    sc_dim groups = attrs_.get_or_else("groups", 1);
-    auto ic = indims[1];
-    auto oc = weightdims[0];
-    COMPILE_ASSERT(ic % groups == 0 && oc % groups == 0,
-            "input channel and output channel must both be divisible by "
-            "groups, but got ic("
-                    << ic << "), oc(" << oc << "), groups(" << groups << ").");
-    COMPILE_ASSERT(ic / groups == weightdims[1],
-            "ic/g should be equal to filter_dims[1], but got "
-                    << ic / groups << " vs " << weightdims[1] << ".");
+    if (groups > 1) {
+        COMPILE_ASSERT(indims[1] == groups && weightdims[0] == groups,
+                "groups should be euqal to attribute");
+        COMPILE_ASSERT(groups == weightdims[0],
+                "g should be equal to filter_dims[0], but got "
+                        << groups << " vs " << weightdims[0] << ".");
+    }
     auto &data_dtype = info_.inputs_[0]->details_.dtype_;
     auto &weight_dtype = info_.inputs_[1]->details_.dtype_;
     if (info_.outputs_.empty()) {
@@ -595,13 +662,44 @@ bool conv_fwd_core_op_t::use_nested_conv_fwd_generator() {
     return use_nested_conv;
 }
 
-bool conv_fwd_core_op_t::use_conv1d() {
+bool conv_fwd_core_op_t::use_conv1d(const context_ptr &ctx) {
     // should be 2d case
     sc_dim groups = attrs_.get_or_else("groups", 1);
     if (groups > 1) { return false; }
     const sc_dims &weight_shape = info_.inputs_[1]->details_.get_plain_dims();
     const sc_dims &data_shape = info_.inputs_[0]->details_.get_plain_dims();
     if (weight_shape.size() != 4UL) { return false; }
+
+    // hasn't support non-zero zps yet
+    bool s8s8_compensation = ctx->machine_.cpu_flags_.fAVX512VNNI
+            && info_.inputs_[0]->details_.dtype_ == datatypes::s8
+            && (!ctx->machine_.brgemm_use_amx_
+                    || (ctx->machine_.brgemm_use_amx_
+                            && !ctx->machine_.cpu_flags_.fAVX512AMXINT8));
+    bool is_dyn_quan = attrs_.has_key(attr_keys::dyn_data_zero_points);
+    auto dyn_data_zero_points = attrs_.get_or_else(
+            attr_keys::dyn_data_zero_points, graph_tensor_ptr());
+    auto dyn_weight_zero_points = attrs_.get_or_else(
+            attr_keys::dyn_weight_zero_points, graph_tensor_ptr());
+    if (is_dyn_quan && !dyn_data_zero_points && !dyn_weight_zero_points) {
+        return false;
+    }
+    auto data_zero_points = attrs_.get_or_else(
+            attr_keys::data_zero_points, std::vector<int> {0});
+    auto weight_zero_points = attrs_.get_or_else(
+            attr_keys::weight_zero_points, std::vector<int> {0});
+    if (!data_zero_points.empty()
+            && !std::all_of(data_zero_points.begin(), data_zero_points.end(),
+                    [](int i) { return i == 0; })) {
+        return false;
+    }
+
+    if ((!weight_zero_points.empty()
+                && !std::all_of(weight_zero_points.begin(),
+                        weight_zero_points.end(), [](int i) { return i == 0; }))
+            || s8s8_compensation) {
+        return false;
+    }
 
     // not support 1x1 with padding case
     const sc_dims &paddings = attrs_.has_key("pads_begin")
@@ -671,8 +769,10 @@ body_generator_ptr conv_fwd_core_op_t::create_generator() {
             ? attrs_.get<sc_dims>("pads_end")
             : attrs_.get<sc_dims>("paddings");
     auto input_plain_dims = get_inputs()[0]->details_.get_plain_dims();
+    auto weight_plain_dims = get_inputs()[1]->details_.get_plain_dims();
     sc_dim groups = attrs_.get_or_else("groups", 1);
-    bool is_dw = (groups > 1) && (groups == input_plain_dims[1]);
+    bool is_dw_brdgmm = (groups > 1) && (1 == input_plain_dims[2])
+            && (1 == weight_plain_dims[1]);
 
 #define CREATE_GENERATOR(type) \
     utils::make_unique<type>(this, stride, dilations, pads_begin, pads_end, \
@@ -683,7 +783,7 @@ body_generator_ptr conv_fwd_core_op_t::create_generator() {
     } else if (attrs_.get_or_else("use_rl", ops::rl_kind::NO_LOWERING)
             == ops::rl_kind::FULL_LOWERING) {
         return CREATE_GENERATOR(gen_conv_fwd_rl_t);
-    } else if (is_dw) {
+    } else if (is_dw_brdgmm) {
         return CREATE_GENERATOR(gen_conv_dw_fwd_t);
     } else {
         auto ret = CREATE_GENERATOR(gen_conv_fwd_t);
@@ -717,10 +817,9 @@ void conv_fwd_core_op_t::query_format(context_ptr ctx,
             : info_.inputs_[1]->details_.get_plain_dims();
     auto input_plain_dims = info_.inputs_[0]->details_.get_plain_dims();
     sc_dim groups = attrs_.get_or_else("groups", 1);
-    bool is_dw = (groups > 1) && (groups == input_plain_dims[1]);
-    int ic = input_plain_dims[1] / groups, oc = weight_plain_dims[0] / groups;
-    const bool is_data_blocking
-            = info_.inputs_[0]->details_.get_format().is_blocking();
+    int ic = groups > 1 ? input_plain_dims[2] : input_plain_dims[1],
+        oc = groups > 1 ? weight_plain_dims[1] : weight_plain_dims[0];
+    bool is_dw_brdgmm = (groups > 1) && (1 == ic) && (1 == oc);
     const bool is_weight_blocking
             = info_.inputs_[1]->details_.get_format().is_blocking();
 
@@ -748,7 +847,7 @@ void conv_fwd_core_op_t::query_format(context_ptr ctx,
                 = *config_data_.get_as<conv_fwd_rl_config_t>();
         in_formats.reserve(2);
         K_block = tcfg.brgemm_n;
-    } else if (is_dw) {
+    } else if (is_dw_brdgmm) {
         const conv_dw_fwd_config_t &tcfg
                 = *config_data_.get_as<conv_dw_fwd_config_t>();
         auto body_gen = create_generator();
@@ -763,7 +862,7 @@ void conv_fwd_core_op_t::query_format(context_ptr ctx,
     }
     in_formats.resize(2);
     out_formats.resize(1);
-    const bool is_3d = ndims_ == 5;
+    const bool is_3d = ndims_ == (groups > 1 ? 6 : 5);
     const bool is_1d = ndims_ == 3;
     const auto src_dtype = info_.inputs_[0]->details_.dtype_;
     const auto wei_dtype = info_.inputs_[1]->details_.dtype_;
@@ -786,16 +885,15 @@ void conv_fwd_core_op_t::query_format(context_ptr ctx,
                     "constant", const_kind::not_const);
 
     bool channel_last_support = false;
-    auto kh = weight_plain_dims[ndims_ - 2];
-    auto kw = weight_plain_dims[ndims_ - 1];
-    auto is_1x1 = std::all_of(weight_plain_dims.begin() + 2,
+    auto is_1x1 = std::all_of(weight_plain_dims.begin() + 2 + (groups > 1),
             weight_plain_dims.end(), [](int x) { return x == 1; });
     if (!is_1d) {
         channel_last_support = is_1x1 || ops::is_amx_dtype(ctx, src_dtype)
                 || (has_pad && attrs_.get_or_else("inverse_filter", false))
                 || use_rl == ops::rl_kind::FULL_LOWERING;
-        if (use_rl != ops::rl_kind::NO_LOWERING && groups > 1)
+        if (ops::rl_kind::KW_LOWERING == use_rl && groups > 1) {
             channel_last_support = false;
+        }
     }
 
     std::string test_format;
@@ -803,9 +901,11 @@ void conv_fwd_core_op_t::query_format(context_ptr ctx,
         test_format = attrs_.get<std::string>("temp.test_format");
     }
     bool force_channel_last = test_format == "NHWC" || test_format == "NDHWC"
-            || test_format == "NSC";
+            || test_format == "NSC" || test_format == "NHWGC"
+            || test_format == "NDHWGC";
     bool force_blocking = test_format == "NCHWc" || test_format == "NCDHWc"
-            || test_format == "NCSc";
+            || test_format == "NCSc" || test_format == "NGCHWc"
+            || test_format == "NGCDHWc";
 
     auto cur_format_set = std::unordered_set<std::vector<sc_data_format_t>>();
     auto cur_dispatch_key_set = dispatch_key_set_t();
@@ -828,16 +928,20 @@ void conv_fwd_core_op_t::query_format(context_ptr ctx,
             = (((channel_last_support && !force_blocking)
                        || (channel_last_support && force_channel_last))
                       && ic % C_block == 0 && oc % K_block == 0)
-            || dynamic || is_dw;
+            || dynamic || is_dw_brdgmm;
     // data layout
     if (use_channel_last) {
-        data_format = is_3d ? sc_data_format_t::NDHWC()
+        data_format = is_3d ? (groups == 1 ? sc_data_format_t::NDHWC()
+                                           : sc_data_format_t::NDHWGC())
                 : is_1d     ? sc_data_format_t::NSC()
-                            : sc_data_format_t::NHWC();
+                            : (groups == 1 ? sc_data_format_t::NHWC()
+                                           : sc_data_format_t::NHWGC());
     } else {
-        data_format = is_3d ? sc_data_format_t::NCDHWc(C_block)
+        data_format = is_3d ? (groups == 1 ? sc_data_format_t::NCDHWc(C_block)
+                                           : sc_data_format_t::NGCDHWc(C_block))
                 : is_1d     ? sc_data_format_t::NSC()
-                            : sc_data_format_t::NCHWc(C_block);
+                            : (groups == 1 ? sc_data_format_t::NCHWc(C_block)
+                                           : sc_data_format_t::NGCHWc(C_block));
     }
     // weight layout
     if (use_rl == ops::rl_kind::FULL_LOWERING && !dynamic) {
@@ -853,26 +957,44 @@ void conv_fwd_core_op_t::query_format(context_ptr ctx,
             COMPILE_ASSERT(0, "Invalid datatype for reduce lowering!");
         }
     } else {
-        if (is_dw) {
-            weight_format = sc_data_format_t(format_kinds::CDBA);
+        if (is_dw_brdgmm) {
+            weight_format = sc_data_format_t(format_kinds::DECAB);
         } else {
             if (utils::is_one_of(src_dtype, datatypes::u8, datatypes::s8)
                     && wei_dtype == datatypes::s8) {
                 weight_format = is_3d
-                        ? sc_data_format_t::KCDRSck4c(C_block, K_block)
+                        ? (groups == 1 ? sc_data_format_t::KCDRSck4c(
+                                   C_block, K_block)
+                                       : sc_data_format_t::GKCDRSck4c(
+                                               C_block, K_block))
                         : is_1d ? sc_data_format_t::KCSck4c(C_block, K_block)
-                                : sc_data_format_t::KCRSck4c(C_block, K_block);
+                                : (groups == 1 ? sc_data_format_t::KCRSck4c(
+                                           C_block, K_block)
+                                               : sc_data_format_t::GKCRSck4c(
+                                                       C_block, K_block));
             } else if (src_dtype == datatypes::bf16
                     && wei_dtype == datatypes::bf16) {
                 weight_format = is_3d
-                        ? sc_data_format_t::KCDRSck2c(C_block, K_block)
+                        ? (groups == 1 ? sc_data_format_t::KCDRSck2c(
+                                   C_block, K_block)
+                                       : sc_data_format_t::GKCDRSck2c(
+                                               C_block, K_block))
                         : is_1d ? sc_data_format_t::KCSck2c(C_block, K_block)
-                                : sc_data_format_t::KCRSck2c(C_block, K_block);
+                                : (groups == 1 ? sc_data_format_t::KCRSck2c(
+                                           C_block, K_block)
+                                               : sc_data_format_t::GKCRSck2c(
+                                                       C_block, K_block));
             } else {
                 weight_format = is_3d
-                        ? sc_data_format_t::KCDRSck(C_block, K_block)
+                        ? (groups == 1 ? sc_data_format_t::KCDRSck(
+                                   C_block, K_block)
+                                       : sc_data_format_t::GKCDRSck(
+                                               C_block, K_block))
                         : is_1d ? sc_data_format_t::KCSck(C_block, K_block)
-                                : sc_data_format_t::KCRSck(C_block, K_block);
+                                : (groups == 1 ? sc_data_format_t::KCRSck(
+                                           C_block, K_block)
+                                               : sc_data_format_t::GKCRSck(
+                                                       C_block, K_block));
             }
         }
     }
@@ -890,13 +1012,17 @@ void conv_fwd_core_op_t::query_format(context_ptr ctx,
 
     // out layout
     if (use_channel_last) {
-        out_format = is_3d ? sc_data_format_t::NDHWC()
+        out_format = is_3d ? (groups == 1 ? sc_data_format_t::NDHWC()
+                                          : sc_data_format_t::NDHWGC())
                 : is_1d    ? sc_data_format_t::NSC()
-                           : sc_data_format_t::NHWC();
+                           : (groups == 1 ? sc_data_format_t::NHWC()
+                                          : sc_data_format_t::NHWGC());
     } else {
-        out_format = is_3d ? sc_data_format_t::NCDHWc(K_block)
+        out_format = is_3d ? (groups == 1 ? sc_data_format_t::NCDHWc(K_block)
+                                          : sc_data_format_t::NGCDHWc(K_block))
                 : is_1d    ? sc_data_format_t::NSC()
-                           : sc_data_format_t::NCHWc(K_block);
+                           : (groups == 1 ? sc_data_format_t::NCHWc(K_block)
+                                          : sc_data_format_t::NGCHWc(K_block));
     }
 
     std::vector<sc_data_format_t> ret_formats
@@ -1037,10 +1163,402 @@ shape_rl_vec conv_fwd_core_op_t::get_shape_relations_impl(
     return ret;
 }
 
+static graph_tensor_ptr get_conv_rl_real_weight(const graph_tensor_ptr &wei) {
+    auto current = wei;
+    while (current->producer_owner_->isa<padding_op_t>()
+            || current->producer_owner_->isa<tensor_view_op_t>()) {
+        current = current->producer_owner_->get_inputs()[0];
+    }
+    return current;
+}
+
 sc_op_ptr conv_fwd_core_op_t::do_compensations(
         sc_graph_t &mgr, const context_ptr &ctx) {
     need_compensation_ = false;
-    return shared_from_this();
+    // whether we need special compensation for microkernel.
+    bool s8s8_compensation = ctx->machine_.cpu_flags_.fAVX512VNNI
+            && info_.inputs_[0]->details_.dtype_ == datatypes::s8
+            && (!ctx->machine_.brgemm_use_amx_
+                    || (ctx->machine_.brgemm_use_amx_
+                            && !ctx->machine_.cpu_flags_.fAVX512AMXINT8));
+
+    auto cur_node = shared_from_this();
+    sc_dim groups = attrs_.get_or_else("groups", 1);
+    bool is_group_conv = groups > 1;
+
+    auto data_com = get_data_compensation(mgr);
+    auto const_com = get_constant_compensation(mgr);
+    auto s8s8_weight_com
+            = get_s8s8_and_weight_compensation(mgr, s8s8_compensation);
+
+    if (data_com) {
+        cur_node = mgr.make("sub",
+                {cur_node->get_outputs()[0], data_com->get_outputs()[0]}, {},
+                {});
+    }
+    if (s8s8_weight_com[0]) {
+        cur_node = mgr.make("sub",
+                {cur_node->get_outputs()[0],
+                        s8s8_weight_com[0]->get_outputs()[0]},
+                {}, {{"bc_axis", std::vector<int> {1 + is_group_conv}}});
+    }
+    if (s8s8_weight_com[1]) {
+        cur_node = mgr.make("sub",
+                {cur_node->get_outputs()[0],
+                        s8s8_weight_com[1]->get_outputs()[0]},
+                {}, {{"bc_axis", std::vector<int> {1 + is_group_conv}}});
+    }
+    if (const_com) {
+        cur_node = mgr.make("add",
+                {cur_node->get_outputs()[0], const_com->get_outputs()[0]}, {},
+                {});
+    }
+
+    return cur_node;
+}
+
+sc_op_ptr conv_fwd_core_op_t::get_data_compensation(sc_graph_t &mgr) {
+    std::string weight_zp_key = attr_keys::weight_zero_points;
+    std::string dyn_weight_zp_key = attr_keys::dyn_weight_zero_points;
+    bool is_dyn_quan = attrs_.has_key(dyn_weight_zp_key);
+    auto weight_zero_points
+            = attrs_.get_or_else(weight_zp_key, std::vector<int> {0});
+    auto dyn_weight_zero_points
+            = attrs_.get_or_else(dyn_weight_zp_key, graph_tensor_ptr());
+    const auto use_rl = attrs_.get_or_else("use_rl", ops::rl_kind::NO_LOWERING);
+    auto wei_plain_dim = use_rl != ops::rl_kind::NO_LOWERING
+            ? attrs_.get<sc_dims>("origin_wei_plain_dims")
+            : get_inputs()[1]->details_.get_plain_dims();
+    sc_dim groups = attrs_.get_or_else("groups", 1);
+    if (!is_dyn_quan
+            && (weight_zero_points.empty()
+                    || (std::all_of(weight_zero_points.begin(),
+                            weight_zero_points.end(),
+                            [](int i) { return i == 0; })))) {
+        return nullptr;
+    }
+    bool is_group_conv = groups > 1;
+    COMPILE_ASSERT(wei_plain_dim.size() >= 4UL + is_group_conv,
+            "Convolution should have >= 4 dimension(at least 2d)")
+    bool is_3d = wei_plain_dim.size() > (!is_group_conv ? 4 : 5);
+    int kd = is_3d ? wei_plain_dim.at(2 + is_group_conv) : 1;
+    int kh = wei_plain_dim.at(2 + is_3d + is_group_conv);
+    int kw = wei_plain_dim.at(3 + is_3d + is_group_conv);
+    auto data = info_.inputs_[0];
+    auto cast_node = mgr.make("cast", {data}, {}, {{"dtype", datatypes::s32}});
+
+    auto ndims = info_.inputs_[0]->details_.get_plain_dims().size();
+    std::vector<int> rdaxis = {1};
+
+    auto reduce_node = mgr.make("reduce", cast_node->get_outputs(), {},
+            {{"rd_axis", rdaxis}, {"rd_op", 0}, {"keep_dims", true}});
+    sc_op_ptr ret_node;
+    if (is_dyn_quan) {
+        if (!dyn_weight_zero_points) { return nullptr; }
+        COMPILE_ASSERT(dyn_weight_zero_points->details_.get_plain_dims()
+                        == sc_dims {1},
+                "conv_fwd_core does not support per channel weight zero "
+                "points compensation yet");
+        ret_node = mgr.make("mul",
+                {reduce_node->get_outputs()[0], dyn_weight_zero_points}, {},
+                {});
+    } else {
+        std::shared_ptr<static_data_t> weight_zero_points_ptr
+                = std::make_shared<static_data_t>(weight_zero_points);
+        sc_dims const_plain_dims;
+        sc_data_format_t const_format;
+        if (weight_zero_points.size() == 1) {
+            // per tensor
+            const_plain_dims = {1};
+        } else {
+            // per channel
+            COMPILE_ASSERT(0,
+                    "conv_fwd does not support per channel weight zero "
+                    "points "
+                    "compensation yet");
+        }
+        auto constant_node = mgr.make("constant", {}, {},
+                {{"values", weight_zero_points_ptr}, {"dtype", datatypes::s32},
+                        {"plain_dims", const_plain_dims},
+                        {"format", const_format}});
+        ret_node = mgr.make("mul",
+                {reduce_node->get_outputs()[0],
+                        constant_node->get_outputs()[0]},
+                {}, {});
+    }
+    if (kh > 1 || kw > 1 || kd > 1) {
+        std::shared_ptr<static_data_t> kernel_data_ptr
+                = std::make_shared<static_data_t>(
+                        std::vector<int>(kh * kw * kd, 1));
+        auto const_plain_dims = wei_plain_dim;
+        COMPILE_ASSERT(const_plain_dims.size() >= 3,
+                "Convolution should have >= 3 dimension(at least 1d)")
+        const_plain_dims[0] = 1;
+        const_plain_dims[1] = 1;
+        auto constant_node = mgr.make("constant", {}, {},
+                {{"values", kernel_data_ptr}, {"dtype", datatypes::s32},
+                        {"plain_dims", const_plain_dims},
+                        {"format",
+                                use_rl ? sc_data_format_t()
+                                       : info_.inputs_[1]
+                                                 ->details_.get_format()}});
+        auto cast_node = mgr.make("cast", {ret_node->get_outputs()[0]}, {},
+                {{"dtype", datatypes::f32}});
+        constant_node = mgr.make("cast", {constant_node->get_outputs()[0]}, {},
+                {{"dtype", datatypes::f32}});
+        auto conv_attr = attrs_;
+        if (use_rl) {
+            conv_attr["use_rl"] = ops::rl_kind::NO_LOWERING;
+            SC_MODULE_WARN << "Disable conv_rl and fall-back to normal conv "
+                              "for compensation";
+        }
+        auto conv_node = mgr.make("conv_fwd_core",
+                {cast_node->get_outputs()[0], constant_node->get_outputs()[0]},
+                {}, conv_attr);
+        ret_node = mgr.make("cast", {conv_node->get_outputs()[0]}, {},
+                {{"dtype", datatypes::s32}});
+    }
+    return ret_node;
+}
+std::vector<sc_op_ptr> conv_fwd_core_op_t::get_s8s8_and_weight_compensation(
+        sc_graph_t &mgr, bool s8s8_compensation) {
+    std::string data_zp_key = attr_keys::data_zero_points;
+    std::string dyn_data_zp_key = attr_keys::dyn_data_zero_points;
+    bool is_dyn_quan = attrs_.has_key(dyn_data_zp_key);
+    auto data_zero_points
+            = attrs_.get_or_else(data_zp_key, std::vector<int> {0});
+    auto dyn_data_zero_points
+            = attrs_.get_or_else(dyn_data_zp_key, graph_tensor_ptr());
+    bool weight_compensation = (is_dyn_quan && dyn_data_zero_points)
+            || (!data_zero_points.empty()
+                    && !(std::all_of(data_zero_points.begin(),
+                            data_zero_points.end(),
+                            [](int i) { return i == 0; })));
+    std::vector<sc_op_ptr> nodes = {nullptr, nullptr};
+    if (!s8s8_compensation && !weight_compensation) { return nodes; }
+
+    auto weight = get_conv_rl_real_weight(info_.inputs_[1]);
+    auto cast_node
+            = mgr.make("cast", {weight}, {}, {{"dtype", datatypes::s32}});
+
+    // K(CRS)
+    sc_dim groups = attrs_.get_or_else("groups", 1);
+    bool is_group_conv = groups > 1;
+    auto ndims = weight->details_.get_plain_dims().size();
+    std::vector<int> rdaxis(ndims - 1 - is_group_conv);
+    std::iota(rdaxis.begin(), rdaxis.end(), 1 + is_group_conv);
+    auto reduce_node = mgr.make("reduce", cast_node->get_outputs(), {},
+            {{"rd_axis", rdaxis}, {"rd_op", 0}, {"keep_dims", false}});
+
+    if (weight_compensation) {
+        if (is_dyn_quan) {
+            COMPILE_ASSERT(dyn_data_zero_points->details_.get_plain_dims()
+                            == sc_dims {1},
+                    "conv_fwd_core does not support per channel data zero "
+                    "points compensation yet");
+            nodes[0] = mgr.make("mul",
+                    {reduce_node->get_outputs()[0], dyn_data_zero_points}, {},
+                    {});
+        } else {
+            std::shared_ptr<static_data_t> data_zero_points_ptr
+                    = std::make_shared<static_data_t>(data_zero_points);
+            sc_dims const_plain_dims;
+            sc_data_format_t const_format;
+            if (data_zero_points.size() == 1) {
+                // per tensor
+                const_plain_dims = {1};
+            } else {
+                COMPILE_ASSERT(0,
+                        "conv_fwd does not support per channel data zero "
+                        "points "
+                        "compensation yet");
+            }
+            auto constant_node = mgr.make("constant", {}, {},
+                    {{"values", data_zero_points_ptr},
+                            {"dtype", datatypes::s32},
+                            {"plain_dims", const_plain_dims},
+                            {"format", const_format}});
+            nodes[0] = mgr.make("mul",
+                    {reduce_node->get_outputs()[0],
+                            constant_node->get_outputs()[0]},
+                    {}, {});
+        }
+    }
+
+    if (s8s8_compensation) {
+        auto s8_constant_node = mgr.make("constant", {}, {},
+                {{"values",
+                         std::make_shared<static_data_t>(
+                                 std::vector<int> {128})},
+                        {"dtype", datatypes::s32}, {"plain_dims", sc_dims {1}},
+                        {"format", sc_data_format_t()}});
+        nodes[1] = mgr.make("mul",
+                {reduce_node->get_outputs()[0],
+                        s8_constant_node->get_outputs()[0]},
+                {}, {});
+    }
+
+    auto &pads_begin = attrs_.has_key("pads_begin")
+            ? attrs_.get<sc_dims>("pads_begin")
+            : attrs_.get<sc_dims>("paddings");
+    auto &pads_end = attrs_.has_key("pads_end")
+            ? attrs_.get<sc_dims>("pads_end")
+            : attrs_.get<sc_dims>("paddings");
+    bool has_pad = std::any_of(pads_begin.begin(), pads_begin.end(),
+                           [](sc_dim p) { return p > 0; })
+            || std::any_of(pads_end.begin(), pads_end.end(),
+                    [](sc_dim d) { return d > 0; });
+    if (has_pad && (s8s8_compensation || weight_compensation)) {
+        if (s8s8_compensation) { attrs_["padding_value"] = 128; }
+        if (weight_compensation) {
+            COMPILE_ASSERT(data_zero_points.size() == 1,
+                    "padded conv_fwd currently doesn't support per channel "
+                    "zero points");
+            attrs_["padding_value"] = attrs_.get_or_else("padding_value", 0)
+                    + data_zero_points[0];
+        }
+    }
+    return nodes;
+}
+sc_op_ptr conv_fwd_core_op_t::get_constant_compensation(sc_graph_t &g) {
+    bool is_dyn_quan = attrs_.has_key(attr_keys::dyn_data_zero_points);
+    auto data_zero_points = attrs_.get_or_else(
+            attr_keys::data_zero_points, std::vector<int> {0});
+    auto weight_zero_points = attrs_.get_or_else(
+            attr_keys::weight_zero_points, std::vector<int> {0});
+    auto dyn_data_zero_points = attrs_.get_or_else(
+            attr_keys::dyn_data_zero_points, graph_tensor_ptr());
+    auto dyn_weight_zero_points = attrs_.get_or_else(
+            attr_keys::dyn_weight_zero_points, graph_tensor_ptr());
+    auto &pads_begin = attrs_.has_key("pads_begin")
+            ? attrs_.get<sc_dims>("pads_begin")
+            : attrs_.get<sc_dims>("paddings");
+    auto &pads_end = attrs_.has_key("pads_end")
+            ? attrs_.get<sc_dims>("pads_end")
+            : attrs_.get<sc_dims>("paddings");
+    bool has_pad = std::any_of(pads_begin.begin(), pads_begin.end(),
+                           [](sc_dim p) { return p > 0; })
+            || std::any_of(pads_end.begin(), pads_end.end(),
+                    [](sc_dim d) { return d > 0; });
+    sc_dim groups = attrs_.get_or_else("groups", 1);
+    bool is_group_conv = groups > 1;
+    auto data_dims = info_.inputs_[0]->details_.get_plain_dims();
+    const auto use_rl = attrs_.get_or_else("use_rl", ops::rl_kind::NO_LOWERING);
+    auto weight_dims = use_rl != ops::rl_kind::NO_LOWERING
+            ? attrs_.get<sc_dims>("origin_wei_plain_dims")
+            : get_inputs()[1]->details_.get_plain_dims();
+    int C = data_dims.at(1 + is_group_conv);
+    sc_op_ptr ret_node;
+    if (is_dyn_quan) {
+        if (!dyn_data_zero_points || !dyn_weight_zero_points) {
+            return nullptr;
+        }
+    } else {
+        if (data_zero_points.empty() || weight_zero_points.empty()) {
+            return nullptr;
+        }
+        if ((std::all_of(data_zero_points.begin(), data_zero_points.end(),
+                    [](int i) { return i == 0; }))
+                || (std::all_of(weight_zero_points.begin(),
+                        weight_zero_points.end(),
+                        [](int i) { return i == 0; }))) {
+            return nullptr;
+        }
+    }
+    COMPILE_ASSERT(weight_dims.size() >= 4,
+            "Convolution should have >= 4 dimension(at least 2d)")
+    bool is_3d = weight_dims.size() > static_cast<size_t>(4 + is_group_conv);
+    int kd = is_3d ? weight_dims.at(2 + is_group_conv) : 1;
+    int kh = weight_dims.at(2 + is_3d + is_group_conv);
+    int kw = weight_dims.at(3 + is_3d + is_group_conv);
+    if (is_dyn_quan) {
+        COMPILE_ASSERT(
+                dyn_data_zero_points->details_.get_plain_dims() == sc_dims {1}
+                        && dyn_weight_zero_points->details_.get_plain_dims()
+                                == sc_dims {1},
+                "conv_fwd does not support per channel data/weight zero "
+                "points compensation yet");
+        ret_node = g.make(
+                "mul", {dyn_data_zero_points, dyn_weight_zero_points}, {}, {});
+        auto const_reduce = g.make("constant", {}, {},
+                {{"dtype", datatypes::s32},
+                        {"values",
+                                std::make_shared<static_data_t>(
+                                        &C, sizeof(int))},
+                        {"plain_dims", sc_dims {1}}});
+        ret_node = g.make("mul",
+                {ret_node->get_outputs()[0], const_reduce->get_outputs()[0]},
+                {}, {});
+    } else if (!has_pad) {
+        COMPILE_ASSERT(
+                data_zero_points.size() == 1 && weight_zero_points.size() == 1,
+                "conv_fwd does not support per channel data/weight zero "
+                "points "
+                "compensation yet");
+        ret_node = g.make("constant", {}, {},
+                {{"values",
+                         std::make_shared<static_data_t>(std::vector<int> {
+                                 data_zero_points[0] * weight_zero_points[0] * C
+                                 * kd * kh * kw})},
+                        {"dtype", datatypes::s32}, {"plain_dims", sc_dims {1}},
+                        {"format", sc_data_format_t()}});
+    } else {
+        COMPILE_ASSERT(
+                data_zero_points.size() == 1 && weight_zero_points.size() == 1,
+                "conv_fwd does not support per channel data/weight zero "
+                "points "
+                "compensation yet");
+        auto constant_data_zps_dim = data_dims;
+        COMPILE_ASSERT(constant_data_zps_dim.size() >= 3,
+                "Convolution should have >= 3 dimension(at least 1d)");
+
+        constant_data_zps_dim[0] = 1;
+        constant_data_zps_dim[1] = 1;
+        auto constant_data_zps = g.make("constant", {}, {},
+                {{"values",
+                         std::make_shared<static_data_t>(std::vector<int>(
+                                 std::accumulate(constant_data_zps_dim.begin(),
+                                         constant_data_zps_dim.end(), 1,
+                                         std::multiplies<int>()),
+                                 data_zero_points[0] * C))},
+                        {"dtype", datatypes::s32},
+                        {"plain_dims", constant_data_zps_dim},
+                        {"format", info_.inputs_[0]->details_.get_format()}});
+        auto constant_wei_zps_dim = weight_dims;
+        COMPILE_ASSERT(constant_wei_zps_dim.size() >= 3,
+                "Convolution should have >= 3 dimension(at least 1d)");
+
+        constant_wei_zps_dim[0] = 1;
+        constant_wei_zps_dim[1] = 1;
+        auto constant_wei_zps = g.make("constant", {}, {},
+                {{"values",
+                         std::make_shared<static_data_t>(std::vector<int>(
+                                 kd * kh * kw, weight_zero_points[0]))},
+                        {"dtype", datatypes::s32},
+                        {"plain_dims", constant_wei_zps_dim},
+                        {"format",
+                                use_rl ? sc_data_format_t()
+                                       : info_.inputs_[1]
+                                                 ->details_.get_format()}});
+        auto cast_data_zps
+                = g.make("cast", {constant_data_zps->get_outputs()[0]}, {},
+                        {{"dtype", datatypes::f32}});
+        auto cast_wei_zps = g.make("cast", {constant_wei_zps->get_outputs()[0]},
+                {}, {{"dtype", datatypes::f32}});
+        auto conv_attr = attrs_;
+        if (use_rl) {
+            conv_attr["use_rl"] = ops::rl_kind::NO_LOWERING;
+            SC_MODULE_WARN << "Disable conv_rl and fall-back to normal conv "
+                              "for compensation";
+        }
+        auto conv_node = g.make("conv_fwd_core",
+                {cast_data_zps->get_outputs()[0],
+                        cast_wei_zps->get_outputs()[0]},
+                {}, conv_attr);
+        ret_node = g.make("cast", {conv_node->get_outputs()[0]}, {},
+                {{"dtype", datatypes::s32}});
+    }
+    return ret_node;
 }
 
 conv_bwd_data_core_op_t::conv_bwd_data_core_op_t(

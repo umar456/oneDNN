@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -633,8 +633,9 @@ public:
                     || (v->type_ == intrin_type::list_brgemm
                             && v->check_brgemm_arg_size(
                                     brgemm_args::NUM_FULL_ARGS_LIST)));
-            for (int i = 0; i < brgemm_args::C + 1; i++) {
+            for (auto i = 0UL; i < v->args_.size(); i++) {
                 auto &p = v->args_[i];
+                if (!p.defined()) continue;
                 tensor_c tsr = get_base_tensor_of(p);
                 if (tsr.defined()) {
                     switch (i) {
@@ -654,7 +655,7 @@ public:
                             }
                             break;
                         case brgemm_args::C: set_write_tick(tsr, tick_); break;
-                        default: break;
+                        default: set_read_tick(tsr, tick_); break;
                     }
                 }
             }
@@ -1016,7 +1017,12 @@ static const tensor_node *get_inplace_target_if_single_inplace(
                 return utils::find_map_value(
                         identity_to_tensor, (*v)[0].to_reuse_.get());
             })
-            .map([](const expr_c *v) { return v->as<tensor_c>().get(); })
+            .map([](const expr_c *v) {
+                // identity_to_tensor might map to empty pointer if the identity
+                // is mapped to multiple buffers. Let's filter that out.
+                return *v;
+            })
+            .map([](const expr_c &v) { return v.as<tensor_c>().get(); })
             .filter([base](const tensor_node *v) {
                 return base->elem_dtype_ == v->elem_dtype_
                         && get_const_as_int(

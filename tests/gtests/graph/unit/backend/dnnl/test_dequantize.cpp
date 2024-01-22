@@ -24,7 +24,7 @@
 namespace graph = dnnl::impl::graph;
 namespace utils = dnnl::graph::tests::unit::utils;
 
-TEST(Execute, DequantizePerTensor) {
+TEST(test_dequantize_execute, DequantizePerTensor) {
     graph::engine_t *engine = get_engine();
     std::vector<float> scales = {1.f, 0.1f};
     std::vector<int64_t> zps = {0, 10};
@@ -60,7 +60,7 @@ TEST(Execute, DequantizePerTensor) {
         g.add_op(&dequantize);
         g.finalize();
 
-        graph::pass::pass_base_ptr apass = get_pass("dequant_pass");
+        graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -92,7 +92,7 @@ TEST(Execute, DequantizePerTensor) {
     }
 }
 
-TEST(Execute, DequantizePerTensorAnyLayout) {
+TEST(test_dequantize_execute, DequantizePerTensorAnyLayout) {
     graph::engine_t *engine = get_engine();
 
     graph::op_t dequantize(graph::op_kind::Dequantize);
@@ -123,7 +123,7 @@ TEST(Execute, DequantizePerTensorAnyLayout) {
     g.add_op(&dequantize);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("dequant_pass");
+    graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -154,7 +154,7 @@ TEST(Execute, DequantizePerTensorAnyLayout) {
     }
 }
 
-TEST(Execute, DequantizePerChannelSymmetric) {
+TEST(test_dequantize_execute, DequantizePerChannelSymmetric) {
     graph::engine_t *engine = get_engine();
 
     graph::op_t dequantize(graph::op_kind::Dequantize);
@@ -183,7 +183,7 @@ TEST(Execute, DequantizePerChannelSymmetric) {
     g.add_op(&dequantize);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("dequant_pass");
+    graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -213,7 +213,7 @@ TEST(Execute, DequantizePerChannelSymmetric) {
     }
 }
 
-TEST(Execute, DynamicDequantizeS32ZpsPerTensor) {
+TEST(test_dequantize_execute, DynamicDequantizeS32ZpsPerTensor) {
     // default engine kind is cpu.
     graph::engine_t *eng = get_engine();
 
@@ -250,7 +250,7 @@ TEST(Execute, DynamicDequantizeS32ZpsPerTensor) {
     g.add_op(&dync_dequantize);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("dync_dequant_pass");
+    graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -286,7 +286,7 @@ TEST(Execute, DynamicDequantizeS32ZpsPerTensor) {
     }
 }
 
-TEST(Execute, DynamicDequantizeS8ZpsPerTensor) {
+TEST(test_dequantize_execute, DynamicDequantizeS8ZpsPerTensor) {
     // default engine kind is cpu.
     graph::engine_t *eng = get_engine();
 
@@ -323,7 +323,7 @@ TEST(Execute, DynamicDequantizeS8ZpsPerTensor) {
     g.add_op(&dync_dequantize);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("dync_dequant_pass");
+    graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -359,7 +359,7 @@ TEST(Execute, DynamicDequantizeS8ZpsPerTensor) {
     }
 }
 
-TEST(Execute, DynamicDequantizeNoZpsPerTensor) {
+TEST(test_dequantize_execute, DynamicDequantizeNoZpsPerTensor) {
     // default engine kind is cpu.
     graph::engine_t *eng = get_engine();
 
@@ -392,7 +392,7 @@ TEST(Execute, DynamicDequantizeNoZpsPerTensor) {
     g.add_op(&dync_dequantize);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("dync_dequant_pass");
+    graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];

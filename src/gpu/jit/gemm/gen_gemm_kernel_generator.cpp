@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -100,6 +100,7 @@ bool Type::isSubsetOf(Type T) const {
     if (*this == T) return true;
 
     if (isInteger() && T == bf16) return false;
+    if (isInteger() && T == bf8) return false;
 
     return (size() < T.size());
 }
@@ -351,6 +352,7 @@ static inline void movePipes(Subregister &s, bool sizeCanChange = true) {
     DataType type = s.getType();
 
     switch (type) {
+        case DataType::bf8: type = DataType::ub; break;
         case DataType::bf:
         case DataType::hf: type = DataType::uw; break;
         case DataType::tf32:
@@ -377,6 +379,7 @@ static inline void moveToIntPipe(Subregister &s) {
     DataType type = s.getType();
 
     switch (type) {
+        case DataType::bf8: type = DataType::ub; break;
         case DataType::bf:
         case DataType::hf: type = DataType::uw; break;
         case DataType::q:
@@ -392,6 +395,7 @@ static inline void moveToIntPipe(Subregister &s) {
 
 static inline Type sintType(Type T) {
     switch (T) {
+        case Type::bf8:
         case Type::s8:
         case Type::u8: return Type::s8;
         case Type::bf16:
@@ -422,6 +426,7 @@ static inline DataType withSignedness(DataType dt, bool signedType) {
 // Move register region to integer pipe.
 static inline void moveToIntPipe(int esize, RegData &s) {
     switch (s.getType()) {
+        case DataType::bf8: s.setType(DataType::ub); break;
         case DataType::bf:
         case DataType::hf: s.setType(DataType::uw); break;
         case DataType::q:
@@ -2163,6 +2168,7 @@ bool gemm_kernel_generator_t<hw>::getBlockInfo(Type T,
         int &cblock, RegisterBlock &block) {
     bool avoidFragment = (remOpts & AllowFragment) == 0;
     bool allowDesc = remOpts & AllowDescriptors;
+    bool allowFixedMasks = (remOpts & NoFixedMasks) == 0;
     bool prefetch = astrategy.prefetch;
     bool atomic = astrategy.atomic;
     if (hw >= HW::Xe2) allowDesc = false;
@@ -2246,7 +2252,7 @@ bool gemm_kernel_generator_t<hw>::getBlockInfo(Type T,
             auto smode = astrategy.smode;
 
             if (block.colMajor) {
-                Y = r;
+                Y = allowFixedMasks ? r : R;
                 X = C;
                 yblock = &rblock;
                 xblock = &cblock;
@@ -2258,7 +2264,7 @@ bool gemm_kernel_generator_t<hw>::getBlockInfo(Type T,
                 tileX = atype.tileC;
             } else {
                 X = R;
-                Y = c;
+                Y = allowFixedMasks ? c : C;
                 xblock = &rblock;
                 yblock = &cblock;
                 maxXBlock = maxRBlock;
@@ -2518,6 +2524,7 @@ bool gemm_kernel_generator_t<hw>::getBlockInfo(Type T,
                 if (atomic && !nativeAtomic) simdCap = 16;
                 maxElements = simdCap * maxNPack;
                 if (T.size() > stride) maxElements = maxElements * stride / T;
+                if (allowFixedMasks) R = r, C = c;
             }
 
             auto maxABlock = maxElements / (byte1PerSlot ? 1 : atype.crosspack);
@@ -2545,7 +2552,6 @@ bool gemm_kernel_generator_t<hw>::getBlockInfo(Type T,
                     yblock = atype.crosspack; // Remainder loop: no longer packed in memory
 
                 block.crosspack = atype.crosspack;
-                Y = div_up(Y, atype.crosspack);
             };
 
             switch (atype.layout) {
@@ -2690,7 +2696,22 @@ bool gemm_kernel_generator_t<hw>::getBlockInfo(Type T,
                 }
             }
 
-            int nbytes = (rblock * cblock) * T;
+            bool needFRMask
+                    = pseudo && (!remainderR && !is_zero_or_pow2(rblock));
+            bool needFCMask
+                    = pseudo && (!remainderC && !is_zero_or_pow2(cblock));
+
+            if (needFRMask || needFCMask) {
+                // Create fixed mask for this block.
+                auto &fmask = needFRMask ? block.rowMask.fixed
+                                         : block.colMask.fixed;
+                int logicalSlots = (rblock * cblock * T) / maskGranularity;
+                fmask.isFixed = true;
+                fmask.rsize = rblock * cblock;
+                fmask.value = (uint32_t(1) << logicalSlots) - 1;
+            }
+
+            int nbytes = roundup_pow2(rblock * cblock) * T;
             block.simdSize
                     = clamp(roundup_pow2(nbytes) / maskGranularity, 1, maxSIMD);
             block.ld = colMajor ? rblock : cblock;
@@ -2946,6 +2967,7 @@ bool gemm_kernel_generator_t<hw>::tryAddRemainder(Type T, RegisterBlock &block,
                 return false;
         }
         blockNew.bytes = block.bytes;
+        blockNew.offsetAddr = block.offsetAddr;
     }
 
     block = blockNew;
@@ -5359,8 +5381,8 @@ void gemm_kernel_generator_t<hw>::loadMask(MaskAssignment assignment,
 
         uint32_t rsizeScaled = vmask.rsize / vmask.rdivide;
         uint32_t maskLen = vmask.bitRep * vmask.maskRep * rsizeScaled;
-        uint32_t fullMask = (1ul << maskLen) - 1;
-        uint32_t rep1Mask = (1ul << (vmask.bitRep * rsizeScaled)) - 1;
+        uint32_t fullMask = (uint64_t(1) << maskLen) - 1;
+        uint32_t rep1Mask = (uint64_t(1) << (vmask.bitRep * rsizeScaled)) - 1;
         uint32_t repMultiplier = fullMask / rep1Mask;
 
         auto flagType = flag.getType();
@@ -7273,10 +7295,6 @@ void gemm_kernel_generator_t<hw>::outerProductSystolic(int h, int ha, int hb,
                 if (rc != 8 && strategy.extendedAtomicFMA) hw_unsupported();
             }
 
-#ifdef PRERELEASE_HW
-            if (hhbase + ksys < opCount) mod |= Fwd;
-#endif
-
             useDPASW ? dpasw(mod, sdepth, rc, C0, C0, V0, N0)
                      : dpas(mod, sdepth, rc, C0, C0, V0, N0);
         };
@@ -7620,6 +7638,9 @@ void gemm_kernel_generator_t<hw>::updateCLayout(
             return range;
         };
 
+        // Save a little bit of space for temporary allocations inside C update.
+        auto save = state.ra.alloc_sub<uint64_t>();
+
         vector<RegisterBlock> sublayoutExt, sublayoutCopy, sublayoutAcc;
         size_t sublayoutCopySize = 0;
         int bytes = 0, bytesConvert = 0;
@@ -7690,6 +7711,8 @@ void gemm_kernel_generator_t<hw>::updateCLayout(
         sublayoutAcc.reserve(liend - listart);
         for (int l = listart; l < liend; l++)
             sublayoutAcc.push_back(layout[l]);
+
+        state.ra.safeRelease(save);
 
         // Set up C addresses relative to prior blocks.
         // TODO: use inline address offsets instead of setupAddrRel for constant offsets.
@@ -10066,16 +10089,19 @@ bool gemm_kernel_generator_t<hw>::gemmFinalizeSums(const GEMMProblem &problem,
     MOCK_BARRIERS barrierwait();
 
     auto step1 = [&](bool isB, int r, int c) {
+        std::vector<MaskAssignment> masks;
+
         ABs_SLM[isB].setAlignment(r * c * Tc);
         ABs_SLM[isB].crosspack = 1;
         ABs_SLM[isB].layout = !isB ? MatrixLayout::Pc : MatrixLayout::Pr;
         ABs_SLM[isB].packSize = r * c;
-        // Use pseudoblock to share address registers between regular and atomic accesses.
+        // Use pseudoblock to share address registers between regular and atomic accesses,
+        //  or for non-power-of-2 sizes.
+        bool useBlock = AB_coopSplitMN[isB] && is_zero_or_pow2(isB ? c : r);
         ABs_strategySLMAtomic[isB].base = AddressBase::createSLM();
         ABs_strategySLMAtomic[isB].padded = true;
-        ABs_strategySLMAtomic[isB].accessType = AB_coopSplitMN[isB]
-                ? AccessType::Block
-                : AccessType::PseudoBlock;
+        ABs_strategySLMAtomic[isB].accessType
+                = useBlock ? AccessType::Block : AccessType::PseudoBlock;
         ABs_strategySLMAtomic[isB].atomic = !AB_coopSplitMN[isB];
         ABs_strategySLMAtomic[isB].newDP = (hw >= HW::XeHPG);
         ABs_strategySLM[isB] = ABs_strategySLMAtomic[isB];
@@ -10090,7 +10116,12 @@ bool gemm_kernel_generator_t<hw>::gemmFinalizeSums(const GEMMProblem &problem,
                 && getRegLayout(Tc, ABs_layoutSLM[isB], r, c, false, false,
                         true, AvoidFragment, maxRBlock, 0, ABs_SLM[isB],
                         ABs_strategySLMAtomic[isB])
-                && matchLayouts(Tc, ABs_layoutSLM[isB], *ABs_layout[isB]);
+                && matchLayouts(Tc, ABs_layoutSLM[isB], *ABs_layout[isB])
+                && assignMasks(ABs_layoutSLM[isB], LoopM, LoopN, masks,
+                        strategy, state, false);
+
+        Subregister remainders[3] = {Subregister {}};
+        loadMasks(masks, remainders, strategy, state);
 
         Subregister adjBase = ABs_base[isB] = state.ra.alloc_sub<uint32_t>();
         uint32_t slmOffset
@@ -10121,6 +10152,7 @@ bool gemm_kernel_generator_t<hw>::gemmFinalizeSums(const GEMMProblem &problem,
         setupAddr(Tc, ABs_addrs[isB], adjBase, ABs_layoutSLM[isB],
                 Subregister(), ABs_SLM[isB], ABs_strategySLMAtomic[isB],
                 strategy, state);
+        releaseMaskAssignments(masks, state);
 
         if (AB_coopSplitMN[isB]) state.ra.safeRelease(adjBase);
 
@@ -10338,12 +10370,22 @@ void gemm_kernel_generator_t<hw>::gemmBetaScale(const GEMMProblem &problem,
 template <HW hw>
 void gemm_kernel_generator_t<hw>::binaryOp(BinaryOp op, int simd,
         const ngen::RegData &dst, const ngen::RegData &src0,
-        const ngen::RegData &src1) {
+        const ngen::RegData &src1, GEMMState &state) {
     switch (op) {
         case BinaryOp::Add: add(simd, dst, src0, src1); break;
         case BinaryOp::Sub: add(simd, dst, src0, -src1); break;
         case BinaryOp::Mul: mul(simd, dst, src0, src1); break;
         case BinaryOp::Div: stub();
+        case BinaryOp::Prelu: {
+            auto DT = src1.getType();
+            auto nRegs = GRF::bytesToGRFs(hw, simd * getBytes(DT));
+            auto tempRng = state.ra.alloc_range(nRegs);
+            auto temp = tempRng[0].retype(DT);
+            mul(simd, temp, src0, src1);
+            csel(simd | le, dst, temp, src0, src0);
+            state.ra.release(tempRng);
+            break;
+        }
         case BinaryOp::Min: min_(simd, dst, src0, src1); break;
         case BinaryOp::Max: max_(simd, dst, src0, src1); break;
     }
@@ -10359,7 +10401,7 @@ void gemm_kernel_generator_t<hw>::gemmScalarBinaryOpC(BinaryOp op,
 
     map(hw, state.Tacc, state.C_regs[0], state.C_layout, strategy,
             [&](int simd, const RegData &r) {
-                binaryOp(op, simd, r, r, offsetTc);
+                binaryOp(op, simd, r, r, offsetTc, state);
             });
 }
 
@@ -10417,7 +10459,7 @@ void gemm_kernel_generator_t<hw>::gemmVectorBinaryOpC(BinaryOp op, bool column,
                 if (op != BinaryOp::Add) stub();
                 mad(nc, C(1), C(1), offBase(stride()), scale);
             } else
-                binaryOp(op, nc, C(1), C(1), offBase(stride()));
+                binaryOp(op, nc, C(1), C(1), offBase(stride()), state);
 
             x += nc;
         }
@@ -10701,7 +10743,7 @@ void gemm_kernel_generator_t<hw>::gemmApplyPostOps(int poMin, int poMax,
 
 #define FOR_EACH_BINARY \
     for (int i = 0; i < poCount; i++) \
-        if (entries[i].is_binary())
+        if (entries[i].is_binary() || entries[i].is_prelu())
 
         FOR_EACH_BINARY {
             const auto &ld = state.inputs.binaryLDs[i];
@@ -10757,6 +10799,11 @@ void gemm_kernel_generator_t<hw>::gemmApplyPostOps(int poMin, int poMax,
     }
 
     // Apply post-ops to all of C.
+    int C_grfs[256];
+    int C_ngrf = state.C_regs[0].getLen();
+    for (int r = 0; r < C_ngrf; r++)
+        C_grfs[r] = state.C_regs[0][r].getBase();
+
     for (int i = poMin; i < poMax; i++) {
         auto &entry = problem.postOps.entry_[i];
         switch (entry.kind) {
@@ -10776,14 +10823,16 @@ void gemm_kernel_generator_t<hw>::gemmApplyPostOps(int poMin, int poMax,
 
                 injector.set_scratch(scratch);
                 injector.prepare();
-                for (auto &rr : state.C_regs[0].ranges)
-                    injector.compute(rr);
+                injector.compute(C_grfs, C_ngrf);
                 break;
             }
+            case primitive_kind::prelu:
             case primitive_kind::binary: {
                 auto &ld = state.inputs.binaryLDs[i];
                 auto &eff = state.effBinary[i];
-                auto op = dnnlToBinaryOp(entry.binary.alg);
+                auto op = entry.kind == primitive_kind::prelu
+                        ? BinaryOp::Prelu
+                        : dnnlToBinaryOp(entry.binary.alg);
 
                 bool ok = gemmBinaryOpC(op, problem.binaryRow[i],
                         problem.binaryCol[i], problem.Tbinary[i],
@@ -15360,12 +15409,12 @@ bool gemm_kernel_generator_t<hw>::gemmAccumulateCSetup(
                     cColMajor, 1, strategy.C.tileR, strategy.C.tileC, true);
         }
         if (!getRegLayout(Tc_ext, state.C_layoutExt, unrollM, unrollN, remM_Ce,
-                    remN_Ce, true, AllowFragDesc, 0, 0, problem.C,
+                    remN_Ce, true, AllowFragDescNFM, 0, 0, problem.C,
                     state.Cext_strategy))
             return false;
     } else {
         if (!getRegLayout(Tc, state.C_layout, unrollM, unrollN, remM_C, remN_C,
-                    true, AllowFragDesc, 0, 0, problem.C, strategy.C))
+                    true, AllowFragDescNFM, 0, 0, problem.C, strategy.C))
             return false;
     }
 
@@ -15374,7 +15423,7 @@ bool gemm_kernel_generator_t<hw>::gemmAccumulateCSetup(
         // Try preparing C layout without masking (may reduce memory accesses).
         // Only use it if compatible with the masked layout, and saves on send instructions (or avoids pseudoblock/slow scattered byte accesses).
         (void)getRegLayout(Tc_ext, state.C_layoutExtUnmasked, unrollM, unrollN,
-                false, false, true, AllowFragDesc, 0, 0, problem.C,
+                false, false, true, AllowFragDescNFM, 0, 0, problem.C,
                 state.Cext_strategy);
 
         bool useUnmasked = true;
@@ -15395,7 +15444,7 @@ bool gemm_kernel_generator_t<hw>::gemmAccumulateCSetup(
         auto nonatomicCExt = state.Cext_strategy;
         nonatomicCExt.atomic = false;
         (void)getRegLayout(Tc_ext, state.C_layoutExtNonatomicUnmasked, unrollM,
-                unrollN, false, false, true, AllowFragDesc, 0, 0, problem.C,
+                unrollN, false, false, true, AllowFragDescNFM, 0, 0, problem.C,
                 nonatomicCExt);
         bool ok = true;
         if (!state.C_layoutExtUnmasked.empty()) {
@@ -18074,7 +18123,9 @@ void gemm_kernel_generator_t<hw>::gemmOffsetABC(bool initial, Subregister i0,
     }
     if (doBinary)
         for (int i = 0; i < problem.postOps.len(); i++) {
-            if (!problem.postOps.entry_[i].is_binary()) continue;
+            if (!problem.postOps.entry_[i].is_binary()
+                    && !problem.postOps.entry_[i].is_prelu())
+                continue;
             bool row = problem.binaryRow[i], col = problem.binaryCol[i];
             auto T = problem.Tbinary[i];
             auto &ld = state.inputs.binaryLDs[i];
@@ -19081,6 +19132,10 @@ template <HW hw>
 void gemm_kernel_generator_t<hw>::gemmAutoTypeConversions(
         GEMMProblem &problem, const GEMMStrategy &strategy) {
     auto &Ta = problem.Ta, &Tb = problem.Tb, &Tc = problem.Tc;
+
+    if (Ta == Type::bf8) Ta = Type::f16;
+    if (Tb == Type::bf8) Tb = Type::f16;
+    if (Tc == Type::bf8) Tc = Type::f16;
 
     if (hw > HW::Gen9 && !strategy.systolic && Tc == Type::f32) {
         if (Ta == Type::f16) Ta = Type::f32;
@@ -20320,6 +20375,7 @@ CommonDriverInfo gemm_kernel_generator_t<hw>::driverInfo(
         info.flags |= FlagFixedWGK;
     if (problem.alpha.pointer()) info.flags |= FlagAlphaPtr;
     if (problem.beta.pointer()) info.flags |= FlagBetaPtr;
+    if (strategy.nondeterministic(problem)) info.flags |= FlagNondeterministic;
     info.flags |= (strategy.fillGoal << FlagShiftFillGoal) & FlagMaskFillGoal;
     info.slm = int(gemmSLMSize(problem, strategy));
     info.perKSLM = int(gemmPerKSLMSize(problem, strategy));
@@ -20806,6 +20862,16 @@ bool GEMMStrategy::needsTempC(const GEMMProblem &problem) const {
     if (!problem.beta0() && !problem.beta1() && altFusedBeta) return true;
     for (int i = 1; i < problem.postOps.len(); i++)
         if (problem.postOps.entry_[i].kind == primitive_kind::sum) return true;
+    return false;
+}
+
+// Check if this strategy is guaranteed to be nondeterministic.
+bool GEMMStrategy::nondeterministic(const GEMMProblem &problem) const {
+    if (kParallel) return true;
+    if (problem.sumA && slmA && coopA == CoopSplit::K && wg[LoopN] > 2)
+        return true;
+    if (problem.sumB && slmB && coopB == CoopSplit::K && wg[LoopM] > 2)
+        return true;
     return false;
 }
 
@@ -25155,24 +25221,36 @@ bool gemm_kernel_generator_t<hw>::copyRegisters(Type Ts, Type Td,
                                 nelems_real = std::min(nelems_real,
                                         nes_real); // Special case: mixed mode packed downconversion limited to 1 GRF.
 
+                            bool src_bf8
+                                    = (Ts_real.ngen() == ngen::DataType::bf8);
+                            bool dst_bf8
+                                    = (Td_real.ngen() == ngen::DataType::bf8);
+                            bool bf8_align = src_bf8 || dst_bf8;
+                            if (bf8_align) allocTemp();
+
                             // Check if separate conversions are needed due to size changes.
                             auto sconvertCP = (Ts_real.size() / Td_real.size())
                                     * scrosspack;
                             bool sconvert
-                                    = (Td_real.size() == 1 && Ts_real.size() > 1
-                                              && dcrosspack != sconvertCP)
-                                    || (Td_real.size() == 2
-                                            && Ts_real.size() > 2
-                                            && dcrosspack != sconvertCP
-                                            && scrosspack > 1)
-                                    || (Td_real.size() == 1
-                                            && Td_real.isInteger()
-                                            && Ts_real.size() == 4
-                                            && (dreg.getOffset() & 2))
-                                    || (Td_real.size() == 2 && Td_real.isFP()
-                                            && !Ts_real.isFP()
-                                            && dcrosspack != sconvertCP
-                                            && hw > HW::Gen9);
+                                    = ((Td_real.size() == 1
+                                               && Ts_real.size() > 1
+                                               && dcrosspack != sconvertCP)
+                                              || (Td_real.size() == 2
+                                                      && Ts_real.size() > 2
+                                                      && dcrosspack
+                                                              != sconvertCP
+                                                      && scrosspack > 1)
+                                              || (Td_real.size() == 1
+                                                      && Td_real.isInteger()
+                                                      && Ts_real.size() == 4
+                                                      && (dreg.getOffset() & 2))
+                                              || (Td_real.size() == 2
+                                                      && Td_real.isFP()
+                                                      && !Ts_real.isFP()
+                                                      && dcrosspack
+                                                              != sconvertCP
+                                                      && hw > HW::Gen9))
+                                    && !bf8_align;
                             if (sconvert && preserveSrc) stub();
                             auto sregConverted = sconvert
                                     ? sreg.reinterpret(0, Td_real.ngen())(
@@ -25182,12 +25260,14 @@ bool gemm_kernel_generator_t<hw>::copyRegisters(Type Ts, Type Td,
                             auto dconvertCP = (Td_real.size() / Ts_real.size())
                                     * dcrosspack;
                             bool dconvert
-                                    = (Ts_real.size() == 1 && Td_real.size() > 1
-                                              && scrosspack != dconvertCP)
-                                    || (Ts_real == Type::f16
-                                            && Td_real.size() > 2
-                                            && (sreg.getOffset() & 1)
-                                            && hw >= HW::XeHP);
+                                    = ((Ts_real.size() == 1
+                                               && Td_real.size() > 1
+                                               && scrosspack != dconvertCP)
+                                              || (Ts_real == Type::f16
+                                                      && Td_real.size() > 2
+                                                      && (sreg.getOffset() & 1)
+                                                      && hw >= HW::XeHP))
+                                    && !bf8_align;
                             auto dregConverted = dconvert
                                     ? dreg.reinterpret(0, Ts_real.ngen())(
                                             dconvertCP)
@@ -25200,8 +25280,59 @@ bool gemm_kernel_generator_t<hw>::copyRegisters(Type Ts, Type Td,
                                 if (!sconvert && !dconvert)
                                     mmodMov = mmodMov | sat;
                             }
+                            auto cvt_bf8_to_x = [&]() {
+                                mov(nelems_real | modMov, copyTemp[0].ub(),
+                                        sreg.ub()(scrosspack));
+                                shl(nelems_real, copyTemp[1].w(),
+                                        copyTemp[0].b(), 8);
+                                if (Td_real == Type::f16) {
+                                    mov(nelems_real | modMov,
+                                            dreg.uw()(dcrosspack),
+                                            copyTemp[1].uw());
+                                } else if (Td_real == Type::f32) {
+                                    mov(nelems_real | modMov,
+                                            copyTemp[0].sub(0, Td_real.ngen())(
+                                                    1),
+                                            copyTemp[1].hf());
+                                    mov(nelems_real | modMov,
+                                            dreg.ud()(dcrosspack),
+                                            copyTemp[0].ud());
+                                } else
+                                    stub();
+                            };
 
-                            // Finally, copy, with any necessary conjugation and scaling. If doing a raw copy, use another pipe.
+                            auto cvt_x_to_bf8 = [&]() {
+                                auto tmp0 = copyTemp[0].sub(0, Ts_real.ngen());
+                                moveToIntPipe(tmp0);
+                                moveToIntPipe(sreg);
+                                mov(nelems_real | modMov, tmp0(1),
+                                        sreg(scrosspack));
+
+                                if (Ts_real.ngen() == ngen::DataType::hf) {
+
+                                    auto tmp1 = copyTemp[1].bf8();
+                                    mov(nelems_real | modMov, tmp1, tmp0.hf());
+                                    mov(nelems_real | modMov,
+                                            dreg.ub()(dcrosspack), tmp1.ub());
+
+                                } else if (Ts_real.ngen()
+                                        == ngen::DataType::f) {
+
+                                    auto tmp1 = copyTemp[1].sub(
+                                            0, ngen::DataType::hf);
+                                    movePipes(tmp0);
+                                    movePipes(sreg);
+                                    mov(nelems_real | modMov, tmp1(1), tmp0(1));
+                                    mov(nelems_real | modMov, tmp0.bf8(),
+                                            tmp1(1));
+
+                                    mov(nelems_real | modMov,
+                                            dreg.ub()(dcrosspack),
+                                            tmp0.ub()(1));
+                                } else
+                                    stub();
+                            };
+
                             if (!skip) switch (phase) {
                                     case -1:
                                         if (hw == HW::Gen9
@@ -25211,14 +25342,22 @@ bool gemm_kernel_generator_t<hw>::copyRegisters(Type Ts, Type Td,
                                             rnde(nelems_real, sreg(scrosspack),
                                                     sreg(scrosspack));
                                         }
-                                        if (sconvert)
+                                        if (bf8_align) {
+                                            if (src_bf8) {
+                                                cvt_bf8_to_x();
+                                            } else if (dst_bf8) {
+                                                cvt_x_to_bf8();
+                                            }
+                                        } else if (sconvert) {
                                             mov(nelems_real | modMov,
                                                     sregConverted,
                                                     sreg(scrosspack));
+                                        }
                                         break;
                                     case 0:
                                         if (alpha == 1 || alpha == -1) {
-                                            if (Ts_real == Td_real) {
+                                            if (Ts_real == Td_real
+                                                    && !Ts_real.isInteger()) {
                                                 movePipes(sreg,
                                                         scrosspack == 1
                                                                 && dcrosspack
@@ -25267,11 +25406,12 @@ bool gemm_kernel_generator_t<hw>::copyRegisters(Type Ts, Type Td,
                                                                 ? base(1)
                                                                 : base(0, wd,
                                                                         1));
-                                            } else
+                                            } else if (!bf8_align) {
                                                 emov(telems | mmodMov,
                                                         dregConverted,
                                                         sregConverted, strategy,
                                                         state);
+                                            }
                                         } else {
                                             auto realDst = dreg(dcrosspack);
                                             auto effDst = realDst;

@@ -59,6 +59,7 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
             : is_superset(isa, avx)                             ? yword
                                                                 : xword;
     static constexpr auto vlen = cpu_isa_traits<isa>::vlen;
+    static constexpr auto n_vregs = cpu_isa_traits<isa>::n_vregs;
     static constexpr auto simd_w_ = vlen / sizeof(float); // bf16 works on ymms
 
     const memory_desc_wrapper src_d_, dst_d_, diff_dst_d_;
@@ -113,6 +114,9 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
     bool with_postops_ = false;
     bool with_binary_ = false;
     bool with_eltwise_ = false;
+    bool with_src_scales_ = false;
+    bool with_dst_scales_ = false;
+    bool use_ext_aux_vmms_ = false;
 
     size_t unroll_regs_ = 4;
 
@@ -217,11 +221,12 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
 
     enum class op_t : unsigned { max, sum };
 
-    void perform_op(Vmm v, Vmm vtmp, op_t op) {
+    void perform_op(
+            const Vmm &vmm_dst, const Vmm &vmm1, const Vmm &vmm2, op_t op) {
         if (op == op_t::max)
-            uni_vmaxps(v, v, vtmp);
+            uni_vmaxps(vmm_dst, vmm1, vmm2);
         else if (op == op_t::sum)
-            uni_vaddps(v, v, vtmp);
+            uni_vaddps(vmm_dst, vmm1, vmm2);
     }
 
     void get_horizontal_op(const Vmm &vsrc, const Vmm &vtmp, op_t op) {
@@ -232,22 +237,27 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
 
         if (is_superset(isa, avx512_core)) {
             vshuff32x4(ztmp, zsrc, zsrc, 0x4E); // 256-bit shuffle
-            perform_op(vsrc, vtmp, op);
+            perform_op(vsrc, vsrc, vtmp, op);
             vshuff32x4(ztmp, zsrc, zsrc, 0xB1); // 128/256-bit shuffle
-            perform_op(vsrc, vtmp, op);
+            perform_op(vsrc, vsrc, vtmp, op);
         } else if (is_superset(isa, avx2)) {
             vperm2f128(ytmp, ysrc, ysrc, 0x1); // 128/256-bit shuffle
-            perform_op(vsrc, vtmp, op);
+            perform_op(vsrc, vsrc, vtmp, op);
         }
         uni_vshufps(vtmp, vsrc, vsrc, 0x4E); // 64/128-bit shuffle
-        perform_op(vsrc, vtmp, op);
+        perform_op(vsrc, vsrc, vtmp, op);
         uni_vshufps(vtmp, vsrc, vsrc, 0xB1); // 32/64-bit shuffle
-        perform_op(vsrc, vtmp, op);
+        perform_op(vsrc, vsrc, vtmp, op);
     }
 
-    template <typename body_t>
-    void axis_loop(body_t body) {
-        Label main_loop, tail_loop, tail_axis, loop_end;
+    // This function is responsible for setting the unrolling level which
+    // affects vmm indices. Unrolling also affects pre-body and post-body calls
+    // that should be done just once but should use a proper unroll value.
+    // To avoid leaking of unrolling logic outside from this function, it takes
+    // functions to execute pre-body and post-body, too.
+    template <typename pre_body_t, typename body_t, typename post_body_t>
+    void axis_loop(pre_body_t pre_body, body_t body, post_body_t post_body) {
+        Label body_unroll_loop, body_unroll_tail_loop, tail_axis, loop_end;
 
         // reverse_spat_offt to dispatch between labels
         mov(reg_reverse_n_elems, reg_process_n_elems);
@@ -257,13 +267,22 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
             xor_(reg_interim_spat_offt, reg_interim_spat_offt); // scratch addr
         if (!pd_->is_fwd())
             xor_(reg_diff_dst_spat_offt, reg_diff_dst_spat_offt); // d_dst addr
-        L(main_loop);
+
+        // `pre_body` and `post_body` functions are called with the maximum
+        // unroll value of a `body` function as they operate over vmms,
+        // which numeration depends on that value.
+        const auto max_body_unroll = n_loops_ ? unroll_regs_
+                : loop_tail_                  ? loop_tail_
+                                              : 1;
+        pre_body(max_body_unroll);
+
+        L(body_unroll_loop);
         {
             if (n_loops_) {
                 cmp(reg_reverse_n_elems, unroll_regs_ * process_n_elems_);
-                jl(tail_loop, T_NEAR);
+                jl(body_unroll_tail_loop, T_NEAR);
 
-                body(unroll_regs_, false);
+                body(unroll_regs_, max_body_unroll, false);
                 sub(reg_reverse_n_elems, unroll_regs_ * process_n_elems_);
                 add(reg_src_spat_offt, unroll_regs_ * src_next_vreg_stride_);
                 add(reg_dst_spat_offt, unroll_regs_ * dst_next_vreg_stride_);
@@ -273,17 +292,17 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                 if (!pd_->is_fwd())
                     add(reg_diff_dst_spat_offt,
                             unroll_regs_ * diff_dst_next_vreg_stride_);
-                jmp(main_loop);
+                jmp(body_unroll_loop);
             }
         }
 
-        L(tail_loop);
+        L(body_unroll_tail_loop);
         {
             if (loop_tail_) {
                 cmp(reg_reverse_n_elems, loop_tail_ * process_n_elems_);
                 jl(tail_axis, T_NEAR);
 
-                body(loop_tail_, false);
+                body(loop_tail_, max_body_unroll, false);
                 sub(reg_reverse_n_elems, loop_tail_ * process_n_elems_);
                 add(reg_src_spat_offt, loop_tail_ * src_next_vreg_stride_);
                 add(reg_dst_spat_offt, loop_tail_ * dst_next_vreg_stride_);
@@ -302,11 +321,13 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                 cmp(reg_reverse_n_elems, 1);
                 jl(loop_end, T_NEAR);
 
-                body(1, true);
+                body(1, max_body_unroll, true);
             }
         }
 
         L(loop_end);
+
+        post_body(max_body_unroll);
     }
 
     void uni_vaddps_maybe_tail(
@@ -369,12 +390,19 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
         io_[dt]->store(src_vmm, addr, tail && !axis_has_padding_);
     }
 
+    Vmm get_aux_vmm(const Vmm &vmm, int unroll) {
+        return Vmm(vmm.getIdx() + unroll);
+    }
+
+    // TODO: introduce independent vmax split code for SRF.
     // Use ne_convert instruction to load xf16 even/odd elements from memory
     void accumulate_avx2_ne_xf16_vmax() {
         // flush to -FLT_MAX before accumulation
         uni_vmovups(vmax, vneg_flt_max);
 
-        axis_loop([&](int unroll, bool tail = false) {
+        const auto pre_body = [](int max_unroll) {};
+
+        const auto body = [&](int unroll, int max_unroll, bool tail = false) {
             for (int i = 0; i < unroll; i += 2) {
                 const bool can_load_two_simdw = unroll - i >= 2;
                 Vmm vreg_tmp_src_even = Vmm(i + 1);
@@ -392,7 +420,11 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                 if (can_load_two_simdw)
                     uni_vmaxps_maybe_tail(vmax, vreg_tmp_src_odd, vtmp, tail);
             }
-        });
+        };
+
+        const auto post_body = [](int max_unroll) {};
+
+        axis_loop(pre_body, body, post_body);
 
         get_horizontal_op(vmax, vtmp = vsum, op_t::max);
     }
@@ -403,30 +435,75 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
             return;
         }
 
-        // flush to -FLT_MAX before accumulation
-        uni_vmovups(vmax, vneg_flt_max);
+        const auto pre_body = [&](int max_unroll) {
+            // flush to -FLT_MAX before accumulation
+            for (int i = 0; i < max_unroll; i++) {
+                Vmm vreg_tmp_src = Vmm(i + 1);
+                Vmm vreg_tmp_max = get_aux_vmm(vreg_tmp_src, max_unroll);
+                uni_vmovups(vreg_tmp_max, vneg_flt_max);
+            }
+        };
 
-        axis_loop([&](int unroll, bool tail = false) {
+        // Each unroll encounter accumulates maximum values into its own vmm.
+        // It removes dependency on a single vmm when reading data, but
+        // introduces a synchronization between them in a post-body call.
+        const auto body = [&](int unroll, int max_unroll, bool tail = false) {
             for (int i = 0; i < unroll; i++) {
                 Vmm vreg_tmp_src = Vmm(i + 1);
-                vtmp = Vmm(i + 2);
-                // do maxps directly from memory on f32 avx2 for performance purpose
+                Vmm vreg_tmp_max = get_aux_vmm(vreg_tmp_src, max_unroll);
+                // do maxps directly from memory on f32 avx2 for performance
                 if (!tail && is_superset(isa, avx2)
                         && !is_superset(isa, avx512_core)
                         && src_d_.data_type() == f32) {
-                    uni_vmaxps(vmax, vmax, src_ptr(src_next_vreg_stride_ * i));
+                    uni_vmaxps(vreg_tmp_max, vreg_tmp_max,
+                            src_ptr(src_next_vreg_stride_ * i));
                 } else {
                     io_[src_d_.data_type()]->load(
                             src_ptr(src_next_vreg_stride_ * i), vreg_tmp_src,
                             tail);
-                    uni_vmaxps_maybe_tail(vmax, vreg_tmp_src, vtmp, tail);
+                    uni_vmaxps_maybe_tail(
+                            vreg_tmp_max, vreg_tmp_src, vtmp = vsum, tail);
                 }
             }
-        });
+        };
+
+        const auto post_body = [&](int max_unroll) {
+            assert(utils::one_of(max_unroll, 4, 3, 2, 1));
+
+            Vmm vreg_tmp_max0 = Vmm(0 + max_unroll + 1);
+            Vmm vreg_tmp_max1 = Vmm(1 + max_unroll + 1);
+            Vmm vreg_tmp_max2 = Vmm(2 + max_unroll + 1);
+            Vmm vreg_tmp_max3 = Vmm(3 + max_unroll + 1);
+
+            switch (max_unroll) {
+                case 4: {
+                    perform_op(vreg_tmp_max0, vreg_tmp_max0, vreg_tmp_max1,
+                            op_t::max);
+                    perform_op(vreg_tmp_max2, vreg_tmp_max2, vreg_tmp_max3,
+                            op_t::max);
+                    perform_op(vmax, vreg_tmp_max0, vreg_tmp_max2, op_t::max);
+                } break;
+                case 3: {
+                    perform_op(vreg_tmp_max0, vreg_tmp_max0, vreg_tmp_max1,
+                            op_t::max);
+                    perform_op(vmax, vreg_tmp_max0, vreg_tmp_max2, op_t::max);
+                } break;
+                case 2: {
+                    perform_op(vmax, vreg_tmp_max0, vreg_tmp_max1, op_t::max);
+                } break;
+                case 1: {
+                    uni_vmovups(vmax, vreg_tmp_max0);
+                } break;
+                default: break;
+            }
+        };
+
+        axis_loop(pre_body, body, post_body);
 
         get_horizontal_op(vmax, vtmp = vsum, op_t::max);
     }
 
+    // TODO: introduce independent vmax split code for SRF.
     // Use ne_convert instruction to load xf16 even/odd elements from memory
     void accumulate_avx2_ne_xf16_vsum() {
         // Initialize saturation vector register
@@ -434,7 +511,9 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
 
         uni_vpxor(vsum, vsum, vsum); // flush to zero before accumulation
 
-        axis_loop([&](int unroll, bool tail = false) {
+        const auto pre_body = [](int max_unroll) {};
+
+        const auto body = [&](int unroll, int max_unroll, bool tail = false) {
             for (int i = 0; i < unroll; i += 2) {
                 const bool can_load_two_simdw = unroll - i >= 2;
                 Vmm vreg_tmp_src_even = Vmm(i + 1);
@@ -476,7 +555,11 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                     }
                 }
             }
-        });
+        };
+
+        const auto post_body = [](int max_unroll) {};
+
+        axis_loop(pre_body, body, post_body);
 
         get_horizontal_op(vsum, vtmp = vmax, op_t::sum);
         if (is_softmax_) uni_vdivps(vsum, vone, vsum, vtmp = vmax);
@@ -492,12 +575,21 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
         // Initialize saturation vector register
         io_.init_saturate_f32({dst_d_.data_type()});
 
-        uni_vpxor(vsum, vsum, vsum); // flush to zero before accumulation
+        const auto pre_body = [&](int max_unroll) {
+            // flush to zero before accumulation
+            for (int i = 0; i < max_unroll; i++) {
+                Vmm vreg_tmp_src = Vmm(i + 1);
+                Vmm vreg_tmp_max = get_aux_vmm(vreg_tmp_src, max_unroll);
+                uni_vpxor(vreg_tmp_max, vreg_tmp_max, vreg_tmp_max);
+            }
+        };
 
-        axis_loop([&](int unroll, bool tail = false) {
+        // Each unroll encounter accumulates maximum values into its own vmm.
+        // It removes dependency on a single vmm when reading data, but
+        // introduces a synchronization between them in a post-body call.
+        const auto body = [&](int unroll, int max_unroll, bool tail = false) {
             for (int i = 0; i < unroll; i++) {
                 Vmm vreg_tmp_src = Vmm(i + 1);
-                vtmp = Vmm(i + 2);
                 io_[src_d_.data_type()]->load(
                         src_ptr(src_next_vreg_stride_ * i), vreg_tmp_src, tail);
                 uni_vsubps(vreg_tmp_src, vreg_tmp_src, vmax);
@@ -509,8 +601,32 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                         store(dst_ptr(dst_next_vreg_stride_ * i), vreg_tmp_src,
                                 dst_d_.data_type(), tail);
                 }
-                exp_injector_->compute_vector(vreg_tmp_src.getIdx());
-                uni_vaddps_maybe_tail(vsum, vreg_tmp_src, vtmp, tail);
+            }
+            for (int i = 0; i < unroll; i++) {
+                Vmm vreg_tmp_src = Vmm(i + 1);
+                Vmm vreg_tmp_sum = get_aux_vmm(vreg_tmp_src, 1 * max_unroll);
+                if (use_ext_aux_vmms_) {
+                    // Prepare indices for exp aux vmms.
+                    injector_utils::vmm_index_set_t exp_aux_indices;
+                    const auto exp_vmm_aux_count
+                            = jit_uni_eltwise_injector_f32<isa>::aux_vecs_count(
+                                    alg_kind::eltwise_exp, pd_->is_fwd(), 0.f);
+                    for (size_t j = 0; j < exp_vmm_aux_count; j++) {
+                        // Insert the next idx starting after `vreg_tmp_sum`.
+                        exp_aux_indices.insert(static_cast<size_t>(
+                                get_aux_vmm(vreg_tmp_sum, (j + 1) * max_unroll)
+                                        .getIdx()));
+                    }
+                    exp_injector_->compute_vector(
+                            vreg_tmp_src.getIdx(), exp_aux_indices);
+                } else {
+                    exp_injector_->compute_vector(vreg_tmp_src.getIdx());
+                }
+                uni_vaddps_maybe_tail(
+                        vreg_tmp_sum, vreg_tmp_src, vtmp = vmax, tail);
+            }
+            for (int i = 0; i < unroll; i++) {
+                Vmm vreg_tmp_src = Vmm(i + 1);
                 if (is_softmax_) { // store after applying exp
                     if (need_scratchpad_)
                         store(interim_ptr(interim_next_vreg_stride_ * i),
@@ -520,16 +636,52 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                                 dst_d_.data_type(), tail);
                 }
             }
-        });
+        };
+
+        const auto post_body = [&](int max_unroll) {
+            assert(utils::one_of(max_unroll, 4, 3, 2, 1));
+
+            Vmm vreg_tmp_sum0 = Vmm(0 + max_unroll + 1);
+            Vmm vreg_tmp_sum1 = Vmm(1 + max_unroll + 1);
+            Vmm vreg_tmp_sum2 = Vmm(2 + max_unroll + 1);
+            Vmm vreg_tmp_sum3 = Vmm(3 + max_unroll + 1);
+
+            switch (max_unroll) {
+                case 4: {
+                    perform_op(vreg_tmp_sum0, vreg_tmp_sum0, vreg_tmp_sum1,
+                            op_t::sum);
+                    perform_op(vreg_tmp_sum2, vreg_tmp_sum2, vreg_tmp_sum3,
+                            op_t::sum);
+                    perform_op(vsum, vreg_tmp_sum0, vreg_tmp_sum2, op_t::sum);
+                } break;
+                case 3: {
+                    perform_op(vreg_tmp_sum0, vreg_tmp_sum0, vreg_tmp_sum1,
+                            op_t::sum);
+                    perform_op(vsum, vreg_tmp_sum0, vreg_tmp_sum2, op_t::sum);
+                } break;
+                case 2: {
+                    perform_op(vsum, vreg_tmp_sum0, vreg_tmp_sum1, op_t::sum);
+                } break;
+                case 1: {
+                    uni_vmovups(vsum, vreg_tmp_sum0);
+                } break;
+                default: break;
+            }
+        };
+
+        axis_loop(pre_body, body, post_body);
 
         get_horizontal_op(vsum, vtmp = vmax, op_t::sum);
+
         if (is_softmax_) uni_vdivps(vsum, vone, vsum, vtmp = vmax);
         if (is_logsoftmax_) log_injector_->compute_vector(vsum.getIdx());
     }
 
     // Use ne_convert instruction to load xf16 even/odd elements from memory
     void compute_avx2_ne_xf16_dst() {
-        axis_loop([&](int unroll, bool tail = false) {
+        const auto pre_body = [](int max_unroll) {};
+
+        const auto body = [&](int unroll, int max_unroll, bool tail = false) {
             for (int i = 0; i < unroll; i += 2) {
                 const bool can_load_two_simdw = unroll - i >= 2;
                 Vmm vreg_tmp_src_even = Vmm(i + 1);
@@ -559,7 +711,7 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                     if (is_logsoftmax_)
                         uni_vsubps(vreg_tmp_src, vreg_tmp_src, vsum);
 
-                    if (is_superset(isa, avx2)) {
+                    if (with_src_scales_) {
                         Vmm vscale = vmax;
                         uni_vmovups(vscale, ptr[reg_src_scales]);
                         uni_vmulps(vreg_tmp_src, vreg_tmp_src, vscale);
@@ -580,7 +732,7 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                         postops_injector_->compute_vector(
                                 vreg_tmp_src.getIdx(), rhs_arg_params);
                     }
-                    if (is_superset(isa, avx2)) {
+                    if (with_dst_scales_) {
                         Vmm vscale = vmax;
                         uni_vmovups(vscale, ptr[reg_dst_scales]);
                         uni_vmulps(vreg_tmp_src, vreg_tmp_src, vscale);
@@ -590,7 +742,11 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                             vreg_tmp_src, dst_d_.data_type(), tail);
                 }
             }
-        });
+        };
+
+        const auto post_body = [](int max_unroll) {};
+
+        axis_loop(pre_body, body, post_body);
     }
 
     void compute_dst() {
@@ -599,7 +755,9 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
             return;
         }
 
-        axis_loop([&](int unroll, bool tail = false) {
+        const auto pre_body = [](int max_unroll) {};
+
+        const auto body = [&](int unroll, int max_unroll, bool tail = false) {
             for (int i = 0; i < unroll; i++) {
                 Vmm vreg_tmp_src = Vmm(i + 1);
                 if (need_scratchpad_)
@@ -609,15 +767,18 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                     io_[dst_d_.data_type()]->load(
                             dst_ptr(dst_next_vreg_stride_ * i), vreg_tmp_src,
                             tail);
+            }
+            for (int i = 0; i < unroll; i++) {
+                Vmm vreg_tmp_src = Vmm(i + 1);
+                Vmm vreg_tmp_scale = get_aux_vmm(vreg_tmp_src, 1 * max_unroll);
 
                 if (is_softmax_) uni_vmulps(vreg_tmp_src, vreg_tmp_src, vsum);
                 if (is_logsoftmax_)
                     uni_vsubps(vreg_tmp_src, vreg_tmp_src, vsum);
 
-                if (is_superset(isa, avx2)) {
-                    Vmm vscale = vmax;
-                    uni_vmovups(vscale, ptr[reg_src_scales]);
-                    uni_vmulps(vreg_tmp_src, vreg_tmp_src, vscale);
+                if (with_src_scales_) {
+                    uni_vmovups(vreg_tmp_scale, ptr[reg_src_scales]);
+                    uni_vmulps(vreg_tmp_src, vreg_tmp_src, vreg_tmp_scale);
                 }
                 if (with_postops_) {
                     binary_injector::rhs_arg_dynamic_params_t rhs_arg_params;
@@ -634,21 +795,29 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                     postops_injector_->compute_vector(
                             vreg_tmp_src.getIdx(), rhs_arg_params);
                 }
-                if (is_superset(isa, avx2)) {
-                    Vmm vscale = vmax;
-                    uni_vmovups(vscale, ptr[reg_dst_scales]);
-                    uni_vmulps(vreg_tmp_src, vreg_tmp_src, vscale);
+                if (with_dst_scales_) {
+                    uni_vmovups(vreg_tmp_scale, ptr[reg_dst_scales]);
+                    uni_vmulps(vreg_tmp_src, vreg_tmp_src, vreg_tmp_scale);
                 }
+            }
+            for (int i = 0; i < unroll; i++) {
+                Vmm vreg_tmp_src = Vmm(i + 1);
                 store(dst_ptr(dst_next_vreg_stride_ * i), vreg_tmp_src,
                         dst_d_.data_type(), tail);
             }
-        });
+        };
+
+        const auto post_body = [](int max_unroll) {};
+
+        axis_loop(pre_body, body, post_body);
     }
 
     void accumulate_vsbr() {
         uni_vpxor(vsbr, vsbr, vsbr); // flush to zero before accumulation
 
-        axis_loop([&](int unroll, bool tail = false) {
+        const auto pre_body = [](int max_unroll) {};
+
+        const auto body = [&](int unroll, int max_unroll, bool tail = false) {
             for (int i = 0; i < unroll; i++) {
                 Vmm vreg_tmp_dst = Vmm(i * 2 + 1);
                 Vmm vreg_tmp_diff_dst = Vmm(i * 2 + 2);
@@ -664,13 +833,19 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                 }
                 uni_vaddps(vsbr, vsbr, vreg_tmp_diff_dst);
             }
-        });
+        };
+
+        const auto post_body = [](int max_unroll) {};
+
+        axis_loop(pre_body, body, post_body);
 
         get_horizontal_op(vsbr, vtmp = vmax, op_t::sum);
     }
 
     void compute_diff_src() {
-        axis_loop([&](int unroll, bool tail = false) {
+        const auto pre_body = [](int max_unroll) {};
+
+        const auto body = [&](int unroll, int max_unroll, bool tail = false) {
             for (int i = 0; i < unroll; i++) {
                 Vmm vreg_tmp_dst = Vmm(i * 2 + 1);
                 Vmm vreg_tmp_diff_dst = Vmm(i * 2 + 2);
@@ -691,7 +866,11 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
                 store(diff_src_ptr(src_next_vreg_stride_ * i),
                         vreg_tmp_diff_dst, src_d_.data_type(), tail);
             }
-        });
+        };
+
+        const auto post_body = [](int max_unroll) {};
+
+        axis_loop(pre_body, body, post_body);
     }
 
     void forward() {
@@ -711,7 +890,7 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
     void generate() override {
         if (pd_->is_fwd() || is_logsoftmax_)
             exp_injector_.reset(new jit_uni_eltwise_injector_f32<isa>(this,
-                    alg_kind::eltwise_exp, 0.0f, 0.0f, 1.0f, true,
+                    alg_kind::eltwise_exp, 0.0f, 0.0f, 1.0f, !use_ext_aux_vmms_,
                     reg_exp_injector_table, injector_mask));
         if (pd_->is_fwd() && is_logsoftmax_) {
             log_injector_.reset(new jit_uni_eltwise_injector_f32<isa>(this,
@@ -763,19 +942,26 @@ struct jit_softmax_dense_kernel_t : jit_softmax_kernel_base_t,
         , jit_generator(jit_name(), nullptr, MAX_CODE_SIZE, true, isa)
         , src_d_(pd_->invariant_src_md())
         , dst_d_(pd_->dst_md())
-        , diff_dst_d_(pd_->diff_dst_md()) {
-        is_bf16_ = utils::one_of(bf16, src_d_.data_type(), dst_d_.data_type());
-        is_f16_ = utils::one_of(f16, src_d_.data_type(), dst_d_.data_type());
-        is_avx2_ne_xf16_ = mayiuse(avx2_vnni_2) && !mayiuse(avx512_core)
-                && (is_bf16_ || is_f16_);
-        axis_simd_full_ = pd_->axis_size() / simd_w_;
-        axis_simd_tail_ = pd_->axis_size() % simd_w_;
-        need_scratchpad_ = utils::one_of(dst_d_.data_type(), u8, s8);
+        , diff_dst_d_(pd_->diff_dst_md())
+        , is_bf16_(utils::one_of(bf16, src_d_.data_type(), dst_d_.data_type()))
+        , is_f16_(utils::one_of(f16, src_d_.data_type(), dst_d_.data_type()))
+        , is_avx2_ne_xf16_(mayiuse(avx2_vnni_2) && !mayiuse(avx512_core)
+                  && (is_bf16_ || is_f16_))
+        , need_scratchpad_(utils::one_of(dst_d_.data_type(), u8, s8))
+        , use_ext_aux_vmms_(!is_logsoftmax_ && n_vregs > 16)
+        , axis_simd_full_(pd_->axis_size() / simd_w_)
+        , axis_simd_tail_(pd_->axis_size() % simd_w_) {
 
         const auto &post_ops = pd_->attr()->post_ops_;
         with_postops_ = post_ops.len() != 0;
         with_binary_ = post_ops.find(primitive_kind::binary) != -1;
         with_eltwise_ = post_ops.find(primitive_kind::eltwise) != -1;
+
+        const auto &attr_scales = pd_->attr()->scales_;
+        with_src_scales_ = is_superset(isa, avx2)
+                && !attr_scales.get(DNNL_ARG_SRC).has_default_values();
+        with_dst_scales_ = is_superset(isa, avx2)
+                && !attr_scales.get(DNNL_ARG_DST).has_default_values();
 
         io::io_conf_t io_conf;
         io::io_tail_conf_t io_tail_conf(simd_w_, axis_simd_tail_,
@@ -847,6 +1033,8 @@ struct jit_softmax_strided_kernel_t : jit_softmax_kernel_base_t,
     bool with_postops_ = false;
     bool with_binary_ = false;
     bool with_eltwise_ = false;
+    bool with_src_scales_ = false;
+    bool with_dst_scales_ = false;
 
     size_t unroll_inner_size_ = 4;
     size_t unroll_axis_size_ = 8;
@@ -906,9 +1094,11 @@ struct jit_softmax_strided_kernel_t : jit_softmax_kernel_base_t,
         if (need_scratchpad_) {
             mov(reg_interim, ptr[reg_param + PARAM_OFF(interim)]);
         }
-        if (is_superset(isa, avx2)) {
+        if (with_src_scales_) {
             mov(reg_tmp, ptr[reg_param + PARAM_OFF(src_scales)]);
             uni_vmovups(vsrc_scale, ptr[reg_tmp]);
+        }
+        if (with_dst_scales_) {
             mov(reg_tmp, ptr[reg_param + PARAM_OFF(dst_scales)]);
             uni_vmovups(vdst_scale, ptr[reg_tmp]);
         }
@@ -1109,7 +1299,7 @@ struct jit_softmax_strided_kernel_t : jit_softmax_kernel_base_t,
                 if (is_logsoftmax_)
                     uni_vsubps(vreg_tmp_src, vreg_tmp_src, vsum);
 
-                if (is_superset(isa, avx2)) {
+                if (with_src_scales_) {
                     uni_vmulps(vreg_tmp_src, vreg_tmp_src, vsrc_scale);
                 }
                 if (with_postops_) {
@@ -1126,7 +1316,7 @@ struct jit_softmax_strided_kernel_t : jit_softmax_kernel_base_t,
                     postops_injector_->compute_vector(
                             vreg_tmp_src.getIdx(), rhs_arg_params);
                 }
-                if (is_superset(isa, avx2)) {
+                if (with_dst_scales_) {
                     uni_vmulps(vreg_tmp_src, vreg_tmp_src, vdst_scale);
                 }
                 store(dst_ptr(get_dst_stride(a, i)), vreg_tmp_src,
@@ -1299,14 +1489,15 @@ struct jit_softmax_strided_kernel_t : jit_softmax_kernel_base_t,
         : jit_softmax_kernel_base_t(pd)
         , jit_generator(jit_name(), nullptr, MAX_CODE_SIZE, true, isa)
         , src_d_(pd_->invariant_src_md())
-        , dst_d_(pd_->dst_md()) {
+        , dst_d_(pd_->dst_md())
+        , need_scratchpad_(utils::one_of(dst_d_.data_type(), u8, s8))
+        , axis_size_(pd_->axis_size())
         // `axis_stride_`, `axis_simd_full_` and `axis_simd_tail_` are only
         // different pieces from the dense version.
-        axis_size_ = pd_->axis_size();
-        axis_stride_ = pd_->axis_stride();
-        axis_simd_full_ = axis_stride_ / simd_w_;
-        axis_simd_tail_ = axis_stride_ % simd_w_;
-        need_scratchpad_ = utils::one_of(dst_d_.data_type(), u8, s8);
+        , axis_stride_(pd_->axis_stride())
+        , axis_simd_full_(axis_stride_ / simd_w_)
+        , axis_simd_tail_(axis_stride_ % simd_w_) {
+
         // Scratchpad size is limited to a single simd_w, thus, no unrolling
         // for such cases.
         if (need_scratchpad_)
@@ -1318,6 +1509,12 @@ struct jit_softmax_strided_kernel_t : jit_softmax_kernel_base_t,
         with_postops_ = post_ops.len() != 0;
         with_binary_ = post_ops.find(primitive_kind::binary) != -1;
         with_eltwise_ = post_ops.find(primitive_kind::eltwise) != -1;
+
+        const auto &attr_scales = pd_->attr()->scales_;
+        with_src_scales_ = is_superset(isa, avx2)
+                && !attr_scales.get(DNNL_ARG_SRC).has_default_values();
+        with_dst_scales_ = is_superset(isa, avx2)
+                && !attr_scales.get(DNNL_ARG_DST).has_default_values();
 
         io::io_conf_t io_conf;
         io::io_tail_conf_t io_tail_conf(simd_w_, axis_simd_tail_,
@@ -1449,12 +1646,12 @@ status_t jit_uni_softmax_fwd_t::execute(const exec_ctx_t &ctx) const {
     const int nthr = pd()->nthr_;
     const char *dst_orig_ptr = dst;
 
-    if (get_verbose(verbose_t::debuginfo) >= 1)
-        printf("[%s][execute] src=%p dst=%p outer_size=%" PRId64
-               " outer_stride=%" PRId64 " inner_size=%" PRId64
-               " inner_stride=%" PRId64 " axis_stride=%" PRId64 "\n",
-                pd()->impl_name(), src, dst, outer_size, outer_stride,
-                inner_size, inner_stride, axis_stride);
+    VDEBUGINFO(1, primitive, softmax,
+            "%s,src=%p dst=%p outer_size=%" PRId64 " outer_stride=%" PRId64
+            " inner_size=%" PRId64 " inner_stride=%" PRId64
+            " axis_stride=%" PRId64,
+            pd()->impl_name(), src, dst, outer_size, outer_stride, inner_size,
+            inner_stride, axis_stride);
 
     parallel_nd_ext(nthr, outer_size, inner_size,
             [&](int ithr, int, dim_t ou, dim_t in) {

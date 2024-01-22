@@ -29,6 +29,7 @@
 #define VERBOSE_create_nested "create_nested"
 #define VERBOSE_exec "exec"
 #define VERBOSE_compile "compile"
+#define VERBOSE_debuginfo "debuginfo"
 
 // log subtypes strings
 #define VERBOSE_check ":check"
@@ -95,5 +96,7 @@
 #define VERBOSE_NONTRIVIAL_STRIDE "only trivial strides are supported"
 #define VERBOSE_UNSUPPORTED_MEM_STRIDE "unsupported memory stride"
 #define VERBOSE_SCRATCHPAD_LIMIT "scratchpad memory limit exceeded"
+#define VERBOSE_PRIMITIVE_CREATION_FAIL "failed to create nested primitive %s"
+#define VERBOSE_UNSUPPORTED_FEATURE "%s feature unavailable for device"
 
 #endif

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -989,8 +989,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         const int exec_arg = entry.first;
         auto &mem = entry.second; // `mem` is modified by filler (reorder).
 
-        ref_mem_map.emplace(
-                exec_arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        // Scratchpad memory relates to a primitive. If reference needs it,
+        // use switch below to define a memory desc for it.
+        if (exec_arg != DNNL_ARG_SCRATCHPAD && exec_arg != DNNL_ARG_WORKSPACE) {
+            ref_mem_map.emplace(exec_arg,
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        }
         auto &ref_mem = ref_mem_map[exec_arg];
 
         switch (exec_arg) {
@@ -1020,8 +1024,7 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                     // re-create it and reorder from former.
                     const auto &bwd_md = query_md(const_pd, exec_arg);
                     dnn_mem_t bwd_mem = dnn_mem_t(bwd_md, test_engine);
-                    if (query_md_ndims(bwd_md) > 0)
-                        SAFE(bwd_mem.reorder(mem_map[exec_arg]), WARN);
+                    SAFE(bwd_mem.reorder(mem_map[exec_arg]), WARN);
                     mem_map[exec_arg] = std::move(bwd_mem);
                 }
                 break;
@@ -1035,8 +1038,7 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                     // re-create it and reorder from former.
                     const auto &bwd_md = query_md(const_pd, exec_arg);
                     dnn_mem_t bwd_mem = dnn_mem_t(bwd_md, test_engine);
-                    if (query_md_ndims(bwd_md) > 0)
-                        SAFE(bwd_mem.reorder(mem_map[exec_arg]), WARN);
+                    SAFE(bwd_mem.reorder(mem_map[exec_arg]), WARN);
                     mem_map[exec_arg] = std::move(bwd_mem);
                 }
                 break;
@@ -1055,8 +1057,7 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                     // re-create it and reorder from former.
                     const auto &bwd_md = query_md(const_pd, exec_arg);
                     dnn_mem_t bwd_mem = dnn_mem_t(bwd_md, test_engine);
-                    if (query_md_ndims(bwd_md) > 0)
-                        SAFE(bwd_mem.reorder(mem_map[exec_arg]), WARN);
+                    SAFE(bwd_mem.reorder(mem_map[exec_arg]), WARN);
                     mem_map[exec_arg] = std::move(bwd_mem);
                 }
                 break;
@@ -1076,8 +1077,8 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                 if (dir & FLAG_FWD)
                     SAFE(fill_memory(prb, DST_ITER_C, mem, ref_mem), WARN);
                 break;
-            case DNNL_ARG_SCRATCHPAD: break;
-            case DNNL_ARG_WORKSPACE: break;
+            case DNNL_ARG_SCRATCHPAD: /* Put internal allocations here */ break;
+            case DNNL_ARG_WORKSPACE: /* Or here... */ break;
             case DNNL_ARG_DIFF_SRC_LAYER:
                 SAFE(fill_activation(prb, DIFF_SRC_LAYER, mem, ref_mem), WARN);
                 break;
@@ -1126,14 +1127,14 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
     return OK;
 }
 
-std::vector<data_kind_t> get_kinds_to_check(const prb_t *prb) {
+std::vector<data_kind_t> get_kinds_to_check(const prb_t *prb, dir_t dir) {
     std::vector<data_kind_t> check_kinds;
-    if (prb->dir & FLAG_FWD) {
+    if ((prb->dir & FLAG_FWD) && (dir & FLAG_FWD)) {
         check_kinds = {data_kind_t::DST, data_kind_t::DST_ITER};
         if (prb->alg == VANILLA_LSTM) {
             check_kinds.push_back(data_kind_t::DST_ITER_C);
         }
-    } else if (prb->dir & FLAG_BWD) {
+    } else if ((prb->dir & FLAG_BWD) && (dir & FLAG_BWD)) {
         check_kinds = {data_kind_t::DST, data_kind_t::DST_ITER,
                 data_kind_t::SRC, data_kind_t::SRC_ITER, data_kind_t::WEI,
                 data_kind_t::WEI_ITER, data_kind_t::BIA};
@@ -1147,11 +1148,8 @@ std::vector<data_kind_t> get_kinds_to_check(const prb_t *prb) {
             check_kinds.push_back(data_kind_t::WEI_PEEPHOLE);
         if (prb->is_lstm_projection())
             check_kinds.push_back(data_kind_t::WEI_PROJECTION);
-    } else {
-        assert(!"unexpected!");
-        SAFE_V(FAIL);
     }
-    assert(!check_kinds.empty());
+    // `check_kinds` is empty for `(prb->dir & FLAG_BWD) && (dir & FLAG_FWD)`.
     return check_kinds;
 }
 
@@ -1192,12 +1190,8 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     SAFE(execute_and_wait(v_prim[0], args, res), WARN);
 
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
-        if (prb.prop != dnnl_backward) {
-            check_correctness(&prb, get_kinds_to_check(&prb), args, ref_args,
-                    setup_cmp, res);
-        }
-    }
+    check_correctness(&prb, get_kinds_to_check(&prb, FLAG_FWD), args, ref_args,
+            setup_cmp, res);
 
     if (prb.prop == dnnl_backward) {
         // Pass same memory map as we need data from forward on backward.
@@ -1212,10 +1206,8 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
         SAFE(execute_and_wait(v_prim[1], args, res), WARN);
 
-        if (has_bench_mode_bit(mode_bit_t::corr)) {
-            check_correctness(&prb, get_kinds_to_check(&prb), args, ref_args,
-                    setup_cmp, res);
-        }
+        check_correctness(&prb, get_kinds_to_check(&prb, FLAG_BWD), args,
+                ref_args, setup_cmp, res);
     }
 
     return measure_perf(prb.ctx_exe, res, prim, args);

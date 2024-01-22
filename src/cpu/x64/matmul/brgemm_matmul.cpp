@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -237,6 +237,19 @@ status_t brgemm_matmul_t<isa>::init(engine_t *engine) {
         CHECK(sparse_decompress_kernel_->create_kernel());
     }
 
+    // JIT to precompute scales
+    const bool is_jit_supported = mayiuse(avx512_core);
+    const auto attr = pd()->attr();
+    if (is_jit_supported && req_copy_scales(attr)) {
+        const auto &attr_scales = attr->scales_;
+        int wei_scale_mask = attr_scales.get(DNNL_ARG_WEIGHTS).mask_;
+        if (wei_scale_mask != 0) {
+            CHECK(safe_ptr_assign(jit_scale_precompute_,
+                    new jit_avx512_core_scale_precompute_t()));
+            CHECK(jit_scale_precompute_->create_kernel());
+        }
+    }
+
     return status::success;
 }
 
@@ -254,9 +267,9 @@ status_t brgemm_matmul_t<isa>::execute_body(const exec_ctx_t &ctx) const {
     const auto dst_d = ctx.memory_mdw(DNNL_ARG_DST, pd()->dst_md());
     matmul_helper_t helper(src_d, weights_d, dst_d);
 
-    auto &scratchpad = ctx.get_scratchpad_grantor();
-    const float *oscales = precompute_scales(
-            scratchpad, src_scales, wei_scales, pd()->N(), pd()->attr());
+    const float *oscales = scale_utils::precompute_scales(
+            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->N(),
+            pd()->attr(), jit_scale_precompute_.get());
 
     brg_matmul_exec_ctx_t brgmm_ctx(ctx, pd(), oscales, src_zero_point,
             wei_zero_point, dst_zero_point, dst_scales, helper);
@@ -542,8 +555,11 @@ void brgemm_matmul_t<isa>::maybe_reduce_partial_results_and_apply_postops(
             const bool n_chunk_tail = nc == N_chunks - 1 && N_chunk_tail > 0;
             auto nb_end = nb_start
                     + (n_chunk_tail ? N_chunk_tail : bgmmc.N_chunk_size);
-            const int curr_N_chunk_elems
-                    = n_chunk_tail ? N_chunk_tail_elems : bgmmc.N_chunk_elems;
+            const bool n_chunk_has_tail
+                    = nc == N_chunks - 1 && N_chunk_tail_elems > 0;
+            const int curr_N_chunk_elems = n_chunk_has_tail
+                    ? N_chunk_tail_elems
+                    : bgmmc.N_chunk_elems;
             for (int mb = mb_start; mb < mb_end; mb++) {
                 const int curr_M_blk = brgmm_ctx.get_M_kernel_size(mb);
                 const int m_ker_idx = brgmm_ctx.get_M_kernel_idx(mb);
@@ -764,11 +780,10 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
     brg_matmul_exec_ctx_t(const exec_ctx_t &ctx, const pd_t *pd,
             const float *oscales, int32_t src_zp, int32_t wei_zp,
             int32_t dst_zp, const float *dst_scales, matmul_helper_t &helper)
-        : bgmmc_(pd->get_brgemm_matmul_conf()) {
-
-        data_A_ptr_ = CTX_IN_MEM(const char *, DNNL_ARG_SRC);
-        data_B_ptr_ = CTX_IN_MEM(const char *, DNNL_ARG_WEIGHTS);
-        data_C_ptr_ = CTX_OUT_MEM(char *, DNNL_ARG_DST);
+        : bgmmc_(pd->get_brgemm_matmul_conf())
+        , data_A_ptr_(CTX_IN_MEM(const char *, DNNL_ARG_SRC))
+        , data_B_ptr_(CTX_IN_MEM(const char *, DNNL_ARG_WEIGHTS))
+        , data_C_ptr_(CTX_OUT_MEM(char *, DNNL_ARG_DST)) {
 
         const memory_desc_wrapper weights_d(pd->weights_md(0));
         if (bgmmc_.packed_sparse_weights) {

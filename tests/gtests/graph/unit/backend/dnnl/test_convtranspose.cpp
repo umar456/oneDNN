@@ -316,7 +316,7 @@ public:
         g.finalize();
 
         graph::pass::pass_base_ptr apass
-                = get_pass("convtranspose_filter_bwd_pass");
+                = get_pass("convtranspose_weights_bwd_pass");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -485,7 +485,7 @@ public:
     }
 };
 
-TEST(Compile, ConvtransposeFp32) {
+TEST(test_convtranspose_compile, ConvtransposeFp32) {
     using dims = graph::dnnl_impl::dims;
 
     graph::engine_t *eng = get_engine();
@@ -542,7 +542,7 @@ TEST_P(convtranspose_4d_5d_t, TestConvtranspose) {
     TestConvtranspose();
 }
 
-INSTANTIATE_TEST_SUITE_P(Execute, convtranspose_4d_5d_t,
+INSTANTIATE_TEST_SUITE_P(test_convtranspose_execute, convtranspose_4d_5d_t,
         ::testing::Values(convtranspose_params_t {"NXC", "IOX", {1, 2, 2, 1},
                                   {1, 1, 3, 3}, false, {1}, {1, 4, 4, 1},
                                   {1, 1}, {1, 1}, {0, 0}, {0, 0}},
@@ -578,7 +578,8 @@ TEST_P(convtranspose_backprop_data_t, TestConvTransposeBackwardData) {
     TestConvTransposeBackwardData();
 }
 
-INSTANTIATE_TEST_SUITE_P(Execute, convtranspose_backprop_data_t,
+INSTANTIATE_TEST_SUITE_P(test_convtranspose_execute,
+        convtranspose_backprop_data_t,
         ::testing::Values(
                 // NCX, IOX
                 convtranspose_bwd_params_t {{1, 1, 2, 2}, {1, 1, 3, 3},
@@ -633,7 +634,8 @@ TEST_P(convtranspose_backprop_filters_t, TestConvTransposeBackwardWeights) {
     TestConvTransposeBackwardWeights();
 }
 
-INSTANTIATE_TEST_SUITE_P(Execute, convtranspose_backprop_filters_t,
+INSTANTIATE_TEST_SUITE_P(test_convtranspose_execute,
+        convtranspose_backprop_filters_t,
         ::testing::Values(convtranspose_bwd_params_t {{1, 1, 2, 2},
                                   {1, 1, 3, 3}, {1, 1, 4, 4}, {1, 1}, {0, 0},
                                   {0, 0}, {1, 1}, "NCX", "IOX"},
@@ -653,7 +655,8 @@ INSTANTIATE_TEST_SUITE_P(Execute, convtranspose_backprop_filters_t,
                         {1, 1, 4, 4, 2}, {1, 1, 1}, {0, 0, 0}, {0, 0, 0},
                         {1, 1, 1}, "NXC", "XOI"}));
 
-TEST(Compile, ConvTransposeBackwardWeightsWithGroupsAndFiltersAnyLayout) {
+TEST(test_convtranspose_compile,
+        ConvTransposeBackwardWeightsWithGroupsAndFiltersAnyLayout) {
     using dims = graph::dnnl_impl::dims;
 
     const dims src_dims {2, 4, 2};
@@ -696,7 +699,7 @@ TEST(Compile, ConvTransposeBackwardWeightsWithGroupsAndFiltersAnyLayout) {
     g.finalize();
 
     graph::pass::pass_base_ptr apass
-            = get_pass("convtranspose_filter_bwd_pass");
+            = get_pass("convtranspose_weights_bwd_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -723,7 +726,7 @@ TEST_P(test_convtranspose_add_compile_t, TestConvTransposeAddCompile) {
     TestConvTransposeAdd();
 }
 
-INSTANTIATE_TEST_SUITE_P(TestConvTransposeAddCompile,
+INSTANTIATE_TEST_SUITE_P(test_convtranspose_add_compile,
         test_convtranspose_add_compile_t,
         ::testing::Values(
                 // with broadcast add, no swap inputs, without bias
@@ -743,7 +746,7 @@ INSTANTIATE_TEST_SUITE_P(TestConvTransposeAddCompile,
                 // no broadcast add (sum), swap inputs, with bias
                 convtranspose_add_params_t {{1, 4, 4, 1}, true, true}));
 
-TEST(operator_kernel, convtranspose_relu) {
+TEST(test_convtranspose_operator_kernel, convtranspose_relu) {
     using dims = graph::dnnl_impl::dims;
 
     std::vector<bool> with_biases = {false, true};
@@ -843,7 +846,7 @@ TEST(operator_kernel, convtranspose_relu) {
     }
 }
 
-TEST(operator_kernel, convtranspose_swish) {
+TEST(test_convtranspose_operator_kernel, convtranspose_swish) {
     using dims = graph::dnnl_impl::dims;
 
     std::vector<bool> with_biases = {false, true};
@@ -940,7 +943,7 @@ TEST(operator_kernel, convtranspose_swish) {
     }
 }
 
-TEST(ExecuteSubgraphInt8, GroupConvTransposeWeightOC1) {
+TEST(test_convtranspose_execute_subgraph_int8, GroupConvTransposeWeightOC1) {
     using dims = graph::dnnl_impl::dims;
 
     graph::engine_t *engine = get_engine();
@@ -1074,7 +1077,8 @@ TEST(ExecuteSubgraphInt8, GroupConvTransposeWeightOC1) {
                 /*atol*/ 1.f));
 }
 
-TEST(ExecuteSubgraphInt8, GroupConvTransposePerTensorScale) {
+TEST(test_convtranspose_execute_subgraph_int8,
+        GroupConvTransposePerTensorScale) {
 
     using dims = graph::dnnl_impl::dims;
 
@@ -1203,7 +1207,7 @@ TEST(ExecuteSubgraphInt8, GroupConvTransposePerTensorScale) {
                     /*atol*/ 1.f));
 }
 
-TEST(ExecuteSubgraphInt8, ConvTranspose1d2d3d) {
+TEST(test_convtranspose_execute_subgraph_int8, ConvTranspose1d2d3d) {
     using dims = graph::dnnl_impl::dims;
 
     graph::engine_t *engine = get_engine();
@@ -1406,7 +1410,7 @@ TEST(ExecuteSubgraphInt8, ConvTranspose1d2d3d) {
     }
 }
 
-TEST(ExecuteSubgraphInt8, ConvTranspose2dEltwise) {
+TEST(test_convtranspose_execute_subgraph_int8, ConvTranspose2dEltwise) {
     using dims = graph::dnnl_impl::dims;
 
     graph::engine_t *engine = get_engine();
@@ -1647,7 +1651,8 @@ TEST(ExecuteSubgraphInt8, ConvTranspose2dEltwise) {
     }
 }
 
-TEST(ExecuteSubgraphInt8, X8X8F32ConvTranspose1d2d3dEltwise) {
+TEST(test_convtranspose_execute_subgraph_int8,
+        X8X8F32ConvTranspose1d2d3dEltwise) {
     using dims = graph::dnnl_impl::dims;
 
     graph::engine_t *engine = get_engine();
@@ -1860,7 +1865,7 @@ TEST(ExecuteSubgraphInt8, X8X8F32ConvTranspose1d2d3dEltwise) {
     }
 }
 
-TEST(ExecuteSubgraphInt8, X8X8F32ConvTransposeSwish) {
+TEST(test_convtranspose_execute_subgraph_int8, X8X8F32ConvTransposeSwish) {
     using dims = graph::dnnl_impl::dims;
 
     graph::engine_t *engine = get_engine();
@@ -2018,7 +2023,7 @@ TEST(ExecuteSubgraphInt8, X8X8F32ConvTransposeSwish) {
     }
 }
 
-TEST(ExecuteSubgraphInt8, ConvTranspose1d2d3dAdd) {
+TEST(test_convtranspose_execute_subgraph_int8, ConvTranspose1d2d3dAdd) {
     using dims = graph::dnnl_impl::dims;
 
     graph::engine_t *engine = get_engine();
@@ -2277,7 +2282,7 @@ TEST(ExecuteSubgraphInt8, ConvTranspose1d2d3dAdd) {
     }
 }
 
-TEST(ExecuteSubgraphInt8, ConvTranspose1d2d3dBinary) {
+TEST(test_convtranspose_execute_subgraph_int8, ConvTranspose1d2d3dBinary) {
     using dims = graph::dnnl_impl::dims;
 
     graph::engine_t *engine = get_engine();
@@ -2476,7 +2481,8 @@ TEST(ExecuteSubgraphInt8, ConvTranspose1d2d3dBinary) {
     }
 }
 
-TEST(ExecuteSubgraphInt8, ConvTranspose2dAddGetInplacePair) {
+TEST(test_convtranspose_execute_subgraph_int8,
+        ConvTranspose2dAddGetInplacePair) {
     using dims = graph::dnnl_impl::dims;
 
     graph::engine_t *engine = get_engine();
@@ -2728,7 +2734,7 @@ TEST(ExecuteSubgraphInt8, ConvTranspose2dAddGetInplacePair) {
     }
 }
 
-TEST(ExecuteSubgraphFp32, Convtranspose3Postops) {
+TEST(test_convtranspose_execute_subgraph_fp32, Convtranspose3Postops) {
     using dims = graph::dnnl_impl::dims;
 
     graph::engine_t *engine = get_engine();
@@ -2908,7 +2914,7 @@ TEST(ExecuteSubgraphFp32, Convtranspose3Postops) {
     }
 }
 
-TEST(Execute, ConvtransposeWithCache) {
+TEST(test_convtranspose_execute, ConvtransposeWithCache) {
     using dims = graph::dnnl_impl::dims;
 
     // default engine kind is cpu.
@@ -2994,4 +3000,47 @@ TEST(Execute, ConvtransposeWithCache) {
     for (size_t i = 0; i < dst2.size(); ++i) {
         ASSERT_FLOAT_EQ(dst2[i], ref_dst2[i]);
     }
+}
+
+TEST(Partition, InvalidInputNumForConvolutionTransposeBackwardWeights) {
+    using dims = graph::dnnl_impl::dims;
+
+    // default engine kind is cpu.
+    graph::engine_t *eng = get_engine();
+    graph::op_t convtranspose_op(graph::op_kind::ConvTransposeBackwardWeights);
+    convtranspose_op.set_attr<dims>(graph::op_attr::strides, dims {2, 2});
+    convtranspose_op.set_attr<dims>(graph::op_attr::dilations, dims {1, 1});
+    convtranspose_op.set_attr<dims>(graph::op_attr::pads_begin, dims {0, 0});
+    convtranspose_op.set_attr<dims>(graph::op_attr::pads_end, dims {41, 41});
+
+    convtranspose_op.set_attr<int64_t>(graph::op_attr::groups, 1);
+    convtranspose_op.set_attr<std::string>(graph::op_attr::data_format, "NCX");
+    convtranspose_op.set_attr<std::string>(
+            graph::op_attr::weights_format, "IOX");
+    convtranspose_op.set_attr<dims>(
+            graph::op_attr::weights_shape, dims {32, 128, 3, 3});
+
+    // prepare logical tensor
+    graph::logical_tensor_t src_lt = utils::logical_tensor_init(
+            0, {1, 32, 28, 28}, graph::data_type::f32);
+    graph::logical_tensor_t diff_dst_lt = utils::logical_tensor_init(
+            1, {1, 128, 16, 16}, graph::data_type::f32);
+    graph::logical_tensor_t wei_shape_lt
+            = utils::logical_tensor_init(2, {1, 4}, graph::data_type::s32);
+    graph::logical_tensor_t dst_lt = utils::logical_tensor_init(
+            3, {32, 128, 3, 3}, graph::data_type::f32);
+
+    convtranspose_op.add_input(src_lt);
+    convtranspose_op.add_input(diff_dst_lt);
+    convtranspose_op.add_input(wei_shape_lt);
+    convtranspose_op.add_output(dst_lt);
+
+    graph::graph_t g(eng->kind());
+    ASSERT_EQ(g.add_op(&convtranspose_op), graph::status::success);
+    g.finalize();
+
+    graph::pass::pass_base_ptr apass
+            = get_pass("convtranspose_weights_bwd_pass");
+    apass->run(g);
+    ASSERT_EQ(g.get_num_partitions(), 0U);
 }

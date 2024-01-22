@@ -153,6 +153,14 @@ CFG(f16f32) {
     DEFAULT(F16_ENTRY_F32);
 }
 
+// f16_math_mode
+dt_conf_t::entry_t F16_MATH_ENTRY {dnnl_f32, -f32_max_exact, f32_max_exact,
+        MIN_F16, MAX_F16, MEAN_F16, STDDEV_F16, EPS_F16};
+CFG_INTERNAL(f16_math, f32) {
+    CASE(BIAS, F32_ENTRY);
+    DEFAULT(F16_MATH_ENTRY);
+}
+
 // s8
 #define EPS_U8 4e-3
 #define EPS_S8 8e-3
@@ -199,6 +207,7 @@ CFG(u8u8u8u8) {
     CASE(DST_ITER, U8_ENTRY_U8);
     CASE(DST_ITER_C, U8_ENTRY_F32);
     CASE(DST_LAYER, U8_ENTRY_U8_EXACT);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -215,6 +224,7 @@ CFG(u8u8u8f32) {
     CASE(DST_ITER, U8_ENTRY_U8);
     CASE(DST_ITER_C, U8_ENTRY_F32);
     CASE(DST_LAYER, U8_ENTRY_F32);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -231,6 +241,7 @@ CFG(f32u8f32u8) {
     CASE(DST_ITER, U8_ENTRY_F32);
     CASE(DST_ITER_C, U8_ENTRY_F32);
     CASE(DST_LAYER, U8_ENTRY_U8_EXACT);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -247,6 +258,7 @@ CFG(f32u8f32f32) {
     CASE(DST_ITER, U8_ENTRY_F32);
     CASE(DST_ITER_C, U8_ENTRY_F32);
     CASE(DST_LAYER, U8_ENTRY_F32);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -263,6 +275,7 @@ CFG(s8s8s8s8) {
     CASE(DST_ITER, S8_ENTRY_S8);
     CASE(DST_ITER_C, S8_ENTRY_F32);
     CASE(DST_LAYER, S8_ENTRY_S8_EXACT);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -279,6 +292,7 @@ CFG(s8s8s8f32) {
     CASE(DST_ITER, S8_ENTRY_S8);
     CASE(DST_ITER_C, S8_ENTRY_F32);
     CASE(DST_LAYER, S8_ENTRY_F32);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -295,6 +309,7 @@ CFG(f32s8f32s8) {
     CASE(DST_ITER, S8_ENTRY_F32);
     CASE(DST_ITER_C, S8_ENTRY_F32);
     CASE(DST_LAYER, S8_ENTRY_S8_EXACT);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -311,14 +326,19 @@ CFG(f32s8f32f32) {
     CASE(DST_ITER, S8_ENTRY_F32);
     CASE(DST_ITER_C, S8_ENTRY_F32);
     CASE(DST_LAYER, S8_ENTRY_F32);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
 } // namespace
 
 const dt_conf_t &dt_conf_t::create(const std::string &str, const attr_t &attr) {
-    if (attr.fpmath_mode == dnnl_fpmath_mode_bf16 && str == "f32")
-        return conf_bf32;
+    if (str == "f32") {
+        if (dnnl::impl::utils::one_of(attr.fpmath_mode, dnnl_fpmath_mode_bf16,
+                    dnnl_fpmath_mode_tf32))
+            return conf_bf32;
+        if (attr.fpmath_mode == dnnl_fpmath_mode_f16) return conf_f16_math;
+    }
     for (const auto cfg : cfg_list)
         if (cfg->str() == str) return *cfg;
     SAFE_V(CRIT);

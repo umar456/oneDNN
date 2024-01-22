@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -397,7 +397,7 @@ int doit(const prb_t *prb, res_t *res) {
     const auto &dg = prb->dg;
     const auto graph_in_ports = dg.get_input_ports();
     auto ograph = dg.to_graph(prb->fpmath_mode);
-    DNN_GRAPH_SAFE(ograph.finalize(), WARN);
+    DNN_GRAPH_SAFE(ograph.finalize(), WARN, res);
     const auto partitions = ograph.get_partitions();
     // a collection of End op's id in this graph
     std::vector<size_t> end_opid_v {};
@@ -412,17 +412,20 @@ int doit(const prb_t *prb, res_t *res) {
     BENCHDNN_PRINT(1, "Partition size %zd.\n", partitions.size());
 
     for (size_t i = 0; i < partitions.size(); ++i) {
-        // Single end op partition is an unsupported partition in the library
         if (!partitions[i].is_supported()) {
             BENCHDNN_PRINT(1, "Partition %zd is unsupported!\n", i);
+            // Single end op partition is an unsupported partition in the library
             if (is_single_end_op_partition(partitions[i], end_opid_v)) {
-                BENCHDNN_PRINT(1, "Partition %zd is End op!\n", i);
                 continue;
             }
-            res->state = UNIMPLEMENTED;
+            res->state = SKIPPED;
+            res->reason = CASE_NOT_SUPPORTED;
             return OK;
         }
+    }
 
+    for (size_t i = 0; i < partitions.size(); ++i) {
+        if (is_single_end_op_partition(partitions[i], end_opid_v)) { continue; }
         auto in_out_lts = partitions[i].get_input_ports();
         const auto &outputs = partitions[i].get_output_ports();
         in_out_lts.insert(in_out_lts.end(), outputs.begin(), outputs.end());
@@ -435,17 +438,23 @@ int doit(const prb_t *prb, res_t *res) {
                 case logical_tensor::data_type::f16:
                     in_out_dt.emplace_back(dnnl_f16);
                     break;
+                case logical_tensor::data_type::f8_e5m2:
+                    in_out_dt.emplace_back(dnnl_f8_e5m2);
+                    break;
+                case logical_tensor::data_type::f8_e4m3:
+                    in_out_dt.emplace_back(dnnl_f8_e4m3);
+                    break;
                 default: break;
             }
         }
         // Get partition direction from op's kind which used for skipping
         // unsupported cases.
-        dir_t dir = FLAG_FWD;
+        dir_t dir = FWD_I;
         const auto &op_ids = partitions[i].get_ops();
         for (const auto &aop : dg.ops_) {
             if (std::count(op_ids.begin(), op_ids.end(), aop.id_)) {
                 if (aop.kind_.find("Backward") != std::string::npos) {
-                    dir = FLAG_BWD;
+                    dir = BWD_DW;
                     break;
                 }
             }
@@ -503,7 +512,7 @@ int doit(const prb_t *prb, res_t *res) {
 
         DNN_GRAPH_SAFE(c_partitions.emplace_back(
                                partitions[i].compile(inputs, outputs, eng)),
-                WARN);
+                WARN, res);
 
         record_queried_logical_tensors(outputs, c_partitions[i - idx_offset],
                 id_to_queried_logical_tensors);

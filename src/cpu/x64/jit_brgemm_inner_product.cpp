@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -94,8 +94,9 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
-    const float *oscales = precompute_scales(ctx.get_scratchpad_grantor(),
-            src_scales, wei_scales, pd()->OC(), pd()->attr());
+    const float *oscales
+            = scale_utils::precompute_scales(scratchpad, src_scales, wei_scales,
+                    pd()->OC(), pd()->attr(), jit_scale_precompute_.get());
 
     const size_t src_dt_size = types::data_type_size(jbgp.src_dt);
     const size_t bia_dt_size
@@ -1048,12 +1049,13 @@ struct brgemm_inner_product_bwd_weights_t<isa>::thread_info_t {
 
     thread_info_t(const brgemm_inner_product_bwd_weights_t *self,
             const exec_ctx_t &ctx, int ithr)
-        : scratchpad(ctx.get_scratchpad_grantor()), ithr(ithr) {
+        : src(CTX_IN_MEM(const char *, DNNL_ARG_SRC))
+        , diff_dst(CTX_IN_MEM(const char *, DNNL_ARG_DIFF_DST))
+        , diff_weights(CTX_OUT_MEM(char *, DNNL_ARG_DIFF_WEIGHTS))
+        , diff_bias(CTX_OUT_MEM(char *, DNNL_ARG_DIFF_BIAS))
+        , scratchpad(ctx.get_scratchpad_grantor())
+        , ithr(ithr) {
 
-        src = CTX_IN_MEM(const char *, DNNL_ARG_SRC);
-        diff_dst = CTX_IN_MEM(const char *, DNNL_ARG_DIFF_DST);
-        diff_weights = CTX_OUT_MEM(char *, DNNL_ARG_DIFF_WEIGHTS);
-        diff_bias = CTX_OUT_MEM(char *, DNNL_ARG_DIFF_BIAS);
         const auto &jbgp = self->pd()->jbgp_;
 
         const bool is_amx = jbgp.is_amx;
