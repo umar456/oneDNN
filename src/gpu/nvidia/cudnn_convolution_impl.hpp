@@ -66,6 +66,7 @@ protected:
 
     bool do_scaling = false;
     bool use_temp_dst_ = false;
+    bool use_scales_dst_ = false;
     cudnnDataType_t computation_data_type = CUDNN_DATA_FLOAT;
     cudnnDataType_t reorder_type = CUDNN_DATA_INT8;
 
@@ -97,7 +98,7 @@ public:
     bool with_scratchpad() const { return scratchpad_size > 0; }
 
     virtual status_t init(engine_t *engine, convolution_pd_t *pd,
-            bool use_scratch_dst = false) {
+            bool use_scratch_dst = false, bool use_scales_dst = false) {
         CHECK(configure_parameters(pd));
         CHECK(create_cudnn_descs(pd));
         CHECK(check_output_dims());
@@ -388,6 +389,8 @@ public:
     }
 
     bool use_temp_dst() const { return use_temp_dst_; }
+
+    bool use_scales_dst() const { return use_scales_dst_; }
 };
 
 struct cudnn_convolution_impl_fwd_t : public cudnn_convolution_impl_base_t {
@@ -461,9 +464,10 @@ public:
         return status::success;
     }
 
-    status_t init(engine_t *engine, convolution_pd_t *pd,
-            bool use_scratch_dst) override {
+    status_t init(engine_t *engine, convolution_pd_t *pd, bool use_scratch_dst,
+            bool use_scales_dst) override {
         use_temp_dst_ = use_scratch_dst;
+        use_scales_dst_ = use_scales_dst;
         CHECK(configure_parameters(pd));
         CHECK(create_cudnn_descs(pd));
         CHECK(configure_alg_kind(engine, pd));
@@ -506,6 +510,11 @@ public:
             weights = w_scratch;
         }
 
+        float *y_fp32_data = nullptr;
+        if (dst_scale && data_types[io::y] == CUDNN_DATA_INT8) {
+            y_fp32_data = (float *)args[11];
+        }
+
         bool fused = conv_bias || conv_bias_eltwise;
 
         float scale = 1.0f;
@@ -524,16 +533,7 @@ public:
             }
         }
 
-        float *y_fp32_data = nullptr;
-        dim_t size_output = 1;
         if (dst_scale && data_types[io::y] == CUDNN_DATA_INT8) {
-            // Compute the size output to pass as a parameter to the
-            // memory allocation call.
-            for (size_t i = 0; i < ndims[io::y]; i++)
-                size_output *= dims[io::y][i];
-            CUDA_EXECUTE_FUNC(cuMemAlloc, (CUdeviceptr *)&y_fp32_data,
-                    size_output * sizeof(float));
-
             if (fused) {
                 auto err = cudnnConvolutionBiasActivationForward(handle, &scale,
                         descs[io::x], x, weights_desc, weights, conv_desc,
@@ -654,7 +654,6 @@ public:
                 if (opTensorDesc)
                     CUDNN_EXECUTE_FUNC_V(
                             cudnnDestroyOpTensorDescriptor, opTensorDesc);
-                CUDA_EXECUTE_FUNC(cuMemFree, (CUdeviceptr)y_fp32_data);
             } else {
                 CUDNN_EXECUTE_FUNC(
                         cudnnScaleTensor, handle, descs[io::y], y, &inv_scale);
@@ -670,7 +669,10 @@ public:
                 = utils::downcast<sycl_cuda_stream_t *>(service_stream);
         auto handle = cuda_stream->get_cudnn_handle();
 
-        if (data_types[y] == CUDNN_DATA_INT8 && do_scaling) {
+        // The scratchpad size will need to be modified in
+        // cases where the dst_scaling is used and the output
+        // uses s8 values.
+        if (use_scales_dst_) {
             CHECK(create_and_set_tensor_descriptor(&y_fp32_desc,
                     CUDNN_DATA_FLOAT, ndims[y], dims[y], strides[y]));
             CHECK(CUDNN_EXECUTE_FUNC_S(cudnnGetConvolutionForwardWorkspaceSize,
