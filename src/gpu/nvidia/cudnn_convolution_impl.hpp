@@ -65,6 +65,7 @@ protected:
     bool with_bias = false;
 
     bool do_scaling = false;
+    bool do_dst_scaling = false;
     bool use_temp_dst_ = false;
     bool use_scales_dst_ = false;
     cudnnDataType_t computation_data_type = CUDNN_DATA_FLOAT;
@@ -135,6 +136,8 @@ public:
         with_bias = pd->with_bias();
         beta = 0.0f;
         do_scaling = !pd->attr()->scales_.has_default_values();
+        do_dst_scaling
+                = !pd->attr()->scales_.get(DNNL_ARG_DST).has_default_values();
         dnnl_descs[x] = *pd->invariant_src_md();
         dnnl_descs[weights] = *pd->invariant_wei_md();
         dnnl_descs[y] = *pd->invariant_dst_md();
@@ -389,6 +392,7 @@ protected:
     cudnnActivationDescriptor_t eltwise_desc = nullptr;
     cudnnTensorDescriptor_t reorder_dst_desc = nullptr;
     cudnnTensorDescriptor_t y_fp32_desc = nullptr;
+    cudnnOpTensorDescriptor_t op_tensor_desc = nullptr;
     cudnnConvolutionFwdAlgo_t fwd_alg_kind;
     std::vector<cudnnConvolutionFwdAlgoPerf_t> perf;
     int requested_algo_count = 0;
@@ -411,6 +415,11 @@ public:
         if (reorder_dst_desc)
             CUDNN_EXECUTE_FUNC_V(
                     cudnnDestroyTensorDescriptor, reorder_dst_desc);
+        if (y_fp32_desc)
+            CUDNN_EXECUTE_FUNC_V(cudnnDestroyTensorDescriptor, y_fp32_desc);
+        if (op_tensor_desc)
+            CUDNN_EXECUTE_FUNC_V(
+                    cudnnDestroyOpTensorDescriptor, op_tensor_desc);
     }
 
     status_t configure_post_ops(convolution_pd_t *pd) {
@@ -444,11 +453,23 @@ public:
         // If the only post-op is fused then there is no need for temp dst
         if (conv_bias_eltwise && num_post_ops == 1) use_temp_dst_ = false;
 
-        if (data_types[y] == CUDNN_DATA_INT8 && use_temp_dst_) {
+        if (data_types[y] == CUDNN_DATA_INT8 && use_temp_dst_
+                && !do_dst_scaling) {
             data_types[y] = CUDNN_DATA_FLOAT;
             need_reorder = true;
             CHECK(create_and_set_tensor_descriptor_ex(&reorder_dst_desc,
                     formats[y], reorder_type, ndims[y], dims[y]));
+        }
+
+        // If dst needs to be scaled and dst datatype is s8
+        if (do_dst_scaling && data_types[y] == CUDNN_DATA_INT8) {
+            CUDNN_EXECUTE_FUNC_V(
+                    cudnnCreateOpTensorDescriptor, &op_tensor_desc);
+            cudnnOpTensorOp_t opTensorOp = CUDNN_OP_TENSOR_ADD;
+            cudnnDataType_t opTensorCompType = CUDNN_DATA_FLOAT;
+            cudnnNanPropagation_t opTensorNanOpt = CUDNN_NOT_PROPAGATE_NAN;
+            CUDNN_EXECUTE_FUNC_S(cudnnSetOpTensorDescriptor, op_tensor_desc,
+                    opTensorOp, opTensorCompType, opTensorNanOpt);
         }
 
         return status::success;
@@ -487,6 +508,12 @@ public:
                 &alpha, descs[io::y], src, &beta, descs[io::y], dst);
     }
 
+    void execute_f32_eltwise(cudnnHandle_t handle, void *src, void *dst) const {
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        CUDNN_EXECUTE_FUNC_V(cudnnActivationForward, handle, eltwise_desc,
+                &alpha, y_fp32_desc, src, &beta, y_fp32_desc, dst);
+    }
     void execute(cudnnHandle_t handle,
             const std::vector<void *> &args) const override {
         auto x = args[0], weights = args[1], y = args[2], bias = args[3],
@@ -604,7 +631,12 @@ public:
 
                 case dnnl_eltwise:
                     if (last_op) {
-                        execute_eltwise(handle, output, y);
+                        if (dst_scale && data_types[io::y] == CUDNN_DATA_INT8) {
+                            execute_f32_eltwise(
+                                    handle, y_fp32_data, y_fp32_data);
+                        } else {
+                            execute_eltwise(handle, output, y);
+                        }
                     } else {
                         execute_eltwise(handle, output, post_op_scratch);
                     }
@@ -623,27 +655,10 @@ public:
                     (CUdeviceptr)dst_scale, sizeof(float));
             float inv_scale = 1.0f / host_dst_scale;
             if (data_types[io::y] == CUDNN_DATA_INT8) {
-                cudnnOpTensorDescriptor_t opTensorDesc;
-                CUDNN_EXECUTE_FUNC_V(
-                        cudnnCreateOpTensorDescriptor, &opTensorDesc);
-
-                cudnnOpTensorOp_t opTensorOp = CUDNN_OP_TENSOR_ADD;
-                cudnnDataType_t opTensorCompType = CUDNN_DATA_FLOAT;
-                cudnnNanPropagation_t opTensorNanOpt = CUDNN_NOT_PROPAGATE_NAN;
-                CUDNN_EXECUTE_FUNC_S(cudnnSetOpTensorDescriptor, opTensorDesc,
-                        opTensorOp, opTensorCompType, opTensorNanOpt);
-
                 float alpha_beta = 0.0f;
-                CUDNN_EXECUTE_FUNC(cudnnOpTensor, handle, opTensorDesc,
+                CUDNN_EXECUTE_FUNC(cudnnOpTensor, handle, op_tensor_desc,
                         &inv_scale, y_fp32_desc, y_fp32_data, &alpha_beta,
                         y_fp32_desc, y_fp32_data, &alpha_beta, descs[io::y], y);
-
-                if (y_fp32_desc)
-                    CUDNN_EXECUTE_FUNC_V(
-                            cudnnDestroyTensorDescriptor, y_fp32_desc);
-                if (opTensorDesc)
-                    CUDNN_EXECUTE_FUNC_V(
-                            cudnnDestroyOpTensorDescriptor, opTensorDesc);
             } else {
                 CUDNN_EXECUTE_FUNC(
                         cudnnScaleTensor, handle, descs[io::y], y, &inv_scale);
