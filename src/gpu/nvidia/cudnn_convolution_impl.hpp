@@ -66,7 +66,6 @@ protected:
 
     bool do_scaling = false;
     bool do_dst_scaling = false;
-    bool do_dst_scaling = false;
     bool use_temp_dst_ = false;
     bool use_scales_dst_ = false;
     cudnnDataType_t computation_data_type = CUDNN_DATA_FLOAT;
