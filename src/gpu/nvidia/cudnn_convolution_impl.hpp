@@ -501,6 +501,16 @@ public:
         }
     }
 
+    void execute_f32_sum(cudnnHandle_t handle, void *y, void *y_fp32_data,
+            float alpha_, float beta_) const {
+        float alpha1 = 0.0f;
+        float alpha2 = alpha_;
+        float beta = beta_;
+        CUDNN_EXECUTE_FUNC(cudnnOpTensor, handle, op_tensor_desc, &alpha1,
+                descs[io::y], y, &alpha2, descs[io::y], y, &beta, y_fp32_desc,
+                y_fp32_data);
+    }
+
     void execute_eltwise(cudnnHandle_t handle, void *src, void *dst) const {
         float alpha = 1.0f;
         float beta = 0.0f;
@@ -620,8 +630,14 @@ public:
                         execute_sum(handle, post_op_reorder, post_op_scratch,
                                 sum_scale, 1.0f);
                     } else if (last_op) {
-                        execute_sum(
-                                handle, post_op_scratch, y, 1.0f, sum_scale);
+                        if (dst_scale && data_types[io::y] == CUDNN_DATA_INT8) {
+                            execute_f32_sum(
+                                    handle, y, y_fp32_data, 1.0f, sum_scale);
+                        } else {
+                            execute_sum(handle, post_op_scratch, y, 1.0f,
+                                    sum_scale);
+                        }
+
                     } else {
                         execute_sum(
                                 handle, y, post_op_scratch, sum_scale, 1.0f);
