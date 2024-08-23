@@ -53,8 +53,8 @@ __attribute__((overloadable)) int local_atomic_max(local int *p, int v) {
 
 #define DEF_BLOCK_LOAD_STORE1(type, itype, suffix) \
     __attribute__((overloadable)) \
-            type##1 block_load(const global type *p, int vlen) __attribute__( \
-                    (enable_if(vlen == 1, "wrong vector length"))) { \
+    type##1 block_load(const global type *p, int vlen) \
+            __attribute__((enable_if(vlen == 1, "wrong vector length"))) { \
         type##1 x; \
         x[0] = as_##type( \
                 intel_sub_group_block_read##suffix((global void *)p)); \
@@ -68,8 +68,8 @@ __attribute__((overloadable)) int local_atomic_max(local int *p, int v) {
 
 #define DEF_BLOCK_LOAD_STORE16(type, itype, suffix) \
     __attribute__((overloadable)) \
-            type##16 block_load(const global type *p, int vlen) __attribute__( \
-                    (enable_if(vlen == 16, "wrong vector length"))) { \
+    type##16 block_load(const global type *p, int vlen) \
+            __attribute__((enable_if(vlen == 16, "wrong vector length"))) { \
         type##16 x; \
         x.s01234567 = as_##type##8( \
                 intel_sub_group_block_read##suffix##8((global void *)p)); \
@@ -103,11 +103,10 @@ DEF_BLOCK_LOAD_STORE16(uint, uint, )
     void __builtin_IB_subgroup_block_write_flat_##suffix( \
             long, int, int, int, int2, itype##vl); \
     __attribute__((overloadable)) type##vl block2d_load(const global type *p, \
-            int w, int h, int ld, int x, int y, int br, int bc, \
-            int sg) __attribute__((enable_if(br == BR, "wrong #rows"))) \
+            int w, int h, int ld, int x, int y, int br, int bc, int sg) \
+            __attribute__((enable_if(br == BR, "wrong #rows"))) \
             __attribute__((enable_if(bc == BC, "wrong #columns"))) \
-                    __attribute__( \
-                            (enable_if(sg == SG, "wrong subgroup size"))) { \
+            __attribute__((enable_if(sg == SG, "wrong subgroup size"))) { \
         ulong pp = as_long(p); \
         ulong prem = pp & 0x3F; \
         pp &= ~0x3F; \
@@ -119,11 +118,10 @@ DEF_BLOCK_LOAD_STORE16(uint, uint, )
     } \
     __attribute__((overloadable)) void block2d_store(type##vl v, \
             global type *p, int w, int h, int ld, int x, int y, int br, \
-            int bc, \
-            int sg) __attribute__((enable_if(br == BR, "wrong #rows"))) \
+            int bc, int sg) \
+            __attribute__((enable_if(br == BR, "wrong #rows"))) \
             __attribute__((enable_if(bc == BC, "wrong #columns"))) \
-                    __attribute__( \
-                            (enable_if(sg == SG, "wrong subgroup size"))) { \
+            __attribute__((enable_if(sg == SG, "wrong subgroup size"))) { \
         ulong pp = as_long(p); \
         ulong prem = pp & 0x3F; \
         pp &= ~0x3F; \
@@ -241,6 +239,43 @@ DEF_BLOCK2D_LOAD_STORE(half, ushort, 16, 16, u16_m8k32v1, 32, 8)
             const global element_type *ptr, int m, int n, int offset_r, \
             int offset_c) { \
         tile_load(t, ptr, m, n, m, offset_r, offset_c); \
+    } \
+    __attribute__((overloadable)) void tile_load_t_full(tile_type *t, \
+            const global element_type *ptr, int ld, int offset_r, \
+            int offset_c) { \
+        ptr += ld * offset_r + offset_c; \
+        _Pragma("unroll") for (int i0 = 0; i0 < br * nbr; \
+                               i0 += sg, ptr += ld * sg) { \
+            _Pragma("unroll") for (int j = 0; j < bc * nbc; j++) { \
+                tile_access(*t, i0, j, sg, br, bc, nbr) \
+                        = ptr[get_sub_group_local_id() * ld + j]; \
+            } \
+        } \
+    } \
+    __attribute__((overloadable)) void tile_load_t(tile_type *t, \
+            const global element_type *ptr, int m, int n, int ld, \
+            int offset_r, int offset_c) { \
+        if (m >= offset_r + br * nbr && n >= offset_c + bc * nbc) { \
+            tile_load_t_full(t, ptr, ld, offset_r, offset_c); \
+            return; \
+        } \
+        ptr += ld * offset_r + offset_c; \
+        _Pragma("unroll") for (int i0 = 0; i0 < br * nbr; \
+                               i0 += sg, ptr += ld * sg) { \
+            int i = i0 + get_sub_group_local_id(); \
+            if (offset_r + i < m) \
+                _Pragma("unroll") for (int j = 0; j < bc * nbc; j++) { \
+                    if (offset_c + j < n) { \
+                        tile_access(*t, i0, j, sg, br, bc, nbr) \
+                                = ptr[get_sub_group_local_id() * ld + j]; \
+                    } \
+                } \
+        } \
+    } \
+    __attribute__((overloadable)) void tile_load_t(tile_type *t, \
+            const global element_type *ptr, int m, int n, int offset_r, \
+            int offset_c) { \
+        tile_load(t, ptr, m, n, n, offset_r, offset_c); \
     } \
     __attribute__((overloadable)) void tile_store_full(tile_type t, \
             local element_type *ptr, int ld, int offset_r, int offset_c) { \
@@ -433,7 +468,7 @@ DEF_BLOCK2D_LOAD_STORE(half, ushort, 16, 16, u16_m8k32v1, 32, 8)
 
 #define DECLARE_2D_TILE(tile_type, element_type, sg, br, bc, nbr, nbc) \
     typedef element_type __attribute__((ext_vector_type(br * bc / sg))) \
-            _e_##tile_type; \
+    _e_##tile_type; \
     typedef struct { \
         _e_##tile_type x[nbr * nbc]; \
     } tile_type; \
