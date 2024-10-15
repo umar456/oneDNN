@@ -22,6 +22,11 @@
 #include "gpu/intel/jit/gemm/gen_gemm_kernel.hpp"
 #include "gpu/intel/jit/gemm/include/microkernel_provider.hpp"
 
+#include <algorithm>
+#include <cstdio>
+#include <iostream>
+#include <vector>
+
 namespace dnnl {
 namespace impl {
 namespace gpu {
@@ -173,6 +178,19 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
 
     if (!config) return status::unimplemented;
 
+    if (key_md()->data_type == dnnl_s4) {
+        config->unroll_m_kq = 16;
+        config->unroll_n_kq = 32;
+        config->wg_m_kq = 8;
+        config->wg_n_kq = 2;
+
+
+        config->unroll_m_vs = 32;
+        config->unroll_n_vs = 16;
+        config->wg_m_vs = 4;
+        config->wg_n_vs = 4;
+
+    }
     /* Get device information */
     HWInformation hw_info;
     hw_info.euCount = dev_info->eu_count();
@@ -200,6 +218,18 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
 
     auto problem_kq = problem;
     problem_kq.A.layout = convert_dnnl_to_kernel_layout(key_md());
+    if (key_md()->data_type == dnnl_s4) {
+        problem_kq.Ta_scale = Type::f32;
+        problem_kq.A_scale.alignment = int(types::data_type_size(data_type::f32));
+        problem_kq.A_scale.layout = MatrixLayout::T;
+
+        problem_kq.Ta = Type::f16;
+        problem_kq.aScale2D = true; //Fails because it cannot allocate additional registers
+        problem_kq.aqGroupM = 1;
+        problem_kq.aqGroupK = 1;
+        problem_kq.bqGroupK = 1;
+        problem_kq.bqGroupK = 1;
+    }
     problem_kq.B.layout = MatrixLayout::Pr;
     problem_kq.C.layout = MatrixLayout::T;
     problem_kq.A.setAlignment(alignmentForLD(d->head_size() * problem.Ta));
@@ -226,6 +256,10 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     micro::GEMMProtocol::Options opts_kq;
     opts_kq.localB = true;
     opts_kq.slmPtr = true;
+    if (key_md()->data_type == dnnl_s4) {
+        opts_kq.scaleA = true;
+        //opts_kq.offsetA = true;
+    }
 
     /* Ask microkernel provider for microkernel */
     try {
@@ -238,6 +272,20 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     problem_vs.Ta = problem_vs.Ta_ext
             = jit::convert_dnnl_to_kernel_type(val_md()->data_type);
     problem_vs.A.layout = convert_dnnl_to_kernel_layout(val_md());
+
+    if (val_md()->data_type == dnnl_s8) {
+        problem_vs.Ta_scale = Type::f32;
+        problem_vs.A_scale.alignment = int(types::data_type_size(data_type::f32));
+        problem_vs.A_scale.layout = MatrixLayout::T;
+
+        problem_vs.Ta = Type::f16;
+        problem_vs.aScale2D = true; //Fails because it cannot allocate additional registers
+        problem_vs.aqGroupM = 1;
+        problem_vs.aqGroupK = 1;
+        problem_vs.bqGroupK = 1;
+        problem_vs.bqGroupK = 1;
+    }
+
     problem_vs.B.layout = MatrixLayout::Pr;
     problem_vs.C.layout = MatrixLayout::N;
     problem_vs.A.setAlignment(alignmentForLD(d->head_size() * problem.Ta));
@@ -257,6 +305,10 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     micro::GEMMProtocol::Options opts_vs;
     opts_vs.localB = true;
     opts_vs.slmPtr = true;
+    if (val_md()->data_type == dnnl_s8) {
+        opts_vs.scaleA = true;
+        //opts_kq.offsetA = true;
+    }
 
     /* Ask microkernel provider for microkernel */
     try {
@@ -299,6 +351,9 @@ status_t micro_sdpa_t::init(impl::engine_t *engine) {
     def_offsets(dst_off, kernel_ctx, "DST", ndims);
     def_offsets(msk_off, kernel_ctx, "MSK", ndims);
     kernel_ctx.define_int("NDIMS", ndims);
+
+    def_data_type(kernel_ctx, key_mdw.data_type(), "KEY");
+    def_data_type(kernel_ctx, val_mdw.data_type(), "VAL");
 
     auto Q_num_heads_dim = qry_mdw.dims()[1];
     kernel_ctx.define_int("KV_GROUP_SIZE", Q_num_heads_dim / d->kv_head_number);
@@ -389,6 +444,10 @@ status_t micro_sdpa_t::execute(const exec_ctx_t &ctx) const {
     const auto &scale = CTX_IN_STORAGE(DNNL_ARG_SCALE);
     const auto &attn_mask = CTX_IN_STORAGE(DNNL_ARG_ATTN_MASK);
 
+    const auto &key_scales
+            = CTX_IN_STORAGE(DNNL_ARG_KEYS | DNNL_ARG_ATTR_SCALES);
+    const auto &value_scales
+            = CTX_IN_STORAGE(DNNL_ARG_VALUES | DNNL_ARG_ATTR_SCALES);
     const dim_t Q = pd()->desc()->queries();
     const dim_t K = pd()->desc()->keys();
     const dim_t D = pd()->desc()->head_size();
@@ -408,6 +467,8 @@ status_t micro_sdpa_t::execute(const exec_ctx_t &ctx) const {
     arg_list.set(6, (int)D);
     arg_list.set(7, (int)K);
     arg_list.set(8, (int)Q);
+    if (key_scales) arg_list.set(9, key_scales);
+    if (value_scales) arg_list.set(10, value_scales);
 
     compute::range_t lws = {(size_t)pd()->sg_size(), (size_t)sg_per_wg, 1};
     compute::range_t gws = lws;

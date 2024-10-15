@@ -69,9 +69,9 @@ struct micro_sdpa_t : public gpu_primitive_t {
                         VERBOSE_INVALID_BROADCAST, "attn_mask", mask_k_index);
             }
             VDISPATCH_SDPA(utils::everyone_is(data_type::f16,
-                                   qry_md()->data_type, key_md()->data_type,
-                                   val_md()->data_type, dst_md()->data_type),
-                    VERBOSE_UNSUPPORTED_DT);
+                                              qry_md()->data_type,
+                                              dst_md()->data_type),
+                           VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_SDPA(set_default_formats() == status::success,
                     VERBOSE_UNSUPPORTED_TAG);
             VDISPATCH_SDPA(desc()->values() == desc()->head_size(),

@@ -154,9 +154,16 @@ DECLARE_2D_TILE_RSELECT(a_scale_tile_type, SUBGROUP_SIZE, ugemm_vs_sg_tile_n, 1,
 #define binary_add(x, y) ((x) + (y))
 
 __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) kernel void
-micro_sdpa(const global half *K, const global half *Q, const global half *V,
+micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DATA_T *V,
         global half *A, global SCALE_DATA_T *scale_ptr, const global half *msk,
-        int d, int k, int q) {
+        int d, int k, int q
+#ifdef KEY_DT_S4
+        , const global float* K_attr_scale
+#endif
+#ifdef VAL_DT_S8
+        , const global float* V_attr_scale
+#endif
+        ) {
     uint sg_ij = sub_group_broadcast(get_local_id(1), 0);
     uint b0 = get_group_id(1);
     uint b1 = get_group_id(2);
@@ -297,9 +304,16 @@ micro_sdpa(const global half *K, const global half *Q, const global half *V,
 #endif
 
         /* Calculate S = (K^T) * Q */
+
+#ifdef KEY_DT_S4
         s_tile_type S_tile
-                = ugemm_kq(K, ldk, Q_slm, D_MAX, k, ugemm_kq_wg_tile_n, d, k0,
+                = ugemm_kq(Q_slm, D_MAX, (global char *)K, ldk, k, ugemm_kq_wg_tile_n, d, k0,
+                           0, 0, sg_i_kq, sg_j_kq, (local char *)ugemm_slm , (global char *)K_attr_scale, 1);
+#else
+        s_tile_type S_tile
+                = ugemm_kq(Q_slm, D_MAX, K, ldk, k, ugemm_kq_wg_tile_n, d, k0,
                         0, 0, sg_i_kq, sg_j_kq, (local char *)ugemm_slm);
+#endif
 
         /* Apply attention mask */
 #if WITH_ATTN_MASK
@@ -448,9 +462,17 @@ micro_sdpa(const global half *K, const global half *Q, const global half *V,
 
         /* Accumulate A += V * S */
         int k_chunk = min(k - k0, ugemm_kq_wg_tile_m);
+
+#ifdef VAL_DT_S8
+        a_tile_type A_tile1 = ugemm_vs(V, ldv, S_slm, ugemm_kq_wg_tile_m, d,
+                ugemm_kq_wg_tile_n, k_chunk, 0, 0, 0, sg_i_vs, sg_j_vs,
+                (local char *)ugemm_slm, (global char *)V_attr_scale, 1);
+#else
         a_tile_type A_tile1 = ugemm_vs(V, ldv, S_slm, ugemm_kq_wg_tile_m, d,
                 ugemm_kq_wg_tile_n, k_chunk, 0, 0, 0, sg_i_vs, sg_j_vs,
                 (local char *)ugemm_slm);
+#endif
+
         V += ldv * ugemm_kq_wg_tile_m;
         tile_binary(A_tile, A_tile1, binary_add);
     }

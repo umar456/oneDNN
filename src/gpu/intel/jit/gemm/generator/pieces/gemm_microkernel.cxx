@@ -179,6 +179,23 @@ micro::Package BLASKernelGenerator<hw>::gemmMicrokernelPackage(const GEMMProblem
         Argument arg;
         arg.name = parg.name;
 
+        if (transposeC) {
+            if (arg.name == "a") arg.name = "b";
+            else if (arg.name == "b") arg.name = "a";
+            else if (arg.name == "lda") arg.name = "ldb";
+            else if (arg.name == "ldb") arg.name = "lda";
+            else if (arg.name == "m") arg.name = "n";
+            else if (arg.name == "n") arg.name = "m";
+            else if (arg.name == "i0") arg.name = "j0";
+            else if (arg.name == "j0") arg.name = "i0";
+            else if (arg.name == "local_id_m") arg.name = "local_id_n";
+            else if (arg.name == "local_id_n") arg.name = "local_id_m";
+            else if (arg.name == "a_scale") arg.name = "b_scale";
+            else if (arg.name == "b_scale") arg.name = "a_scale";
+            else if (arg.name == "a_offset") arg.name = "b_offset";
+            else if (arg.name == "b_offset") arg.name = "a_offset";
+        }
+
         if (arg.name == "c") {
             int tileM = strategy.unroll[LoopM];
             int tileN = strategy.unroll[LoopN];
@@ -242,24 +259,6 @@ micro::Package BLASKernelGenerator<hw>::gemmMicrokernelPackage(const GEMMProblem
         if (arg.name == "b") arg.actualType = microType(problem.Tb_ext);
         if (arg.name == "c") arg.actualType = microType(problem.Tc);
 
-        if (transposeC) {
-            if (arg.name == "a") arg.name = "b";
-            else if (arg.name == "b") arg.name = "a";
-            else if (arg.name == "lda") arg.name = "ldb";
-            else if (arg.name == "ldb") arg.name = "lda";
-            else if (arg.name == "m") arg.name = "n";
-            else if (arg.name == "n") arg.name = "m";
-            else if (arg.name == "i0") arg.name = "j0";
-            else if (arg.name == "j0") arg.name = "i0";
-            else if (arg.name == "local_id_m") arg.name = "local_id_n";
-            else if (arg.name == "local_id_n") arg.name = "local_id_m";
-            else if (arg.name == "a_scale") arg.name = "b_scale";
-            else if (arg.name == "b_scale") arg.name = "a_scale";
-            else if (arg.name == "a_offset") arg.name = "b_offset";
-            else if (arg.name == "b_offset") arg.name = "a_offset";
-            else if (arg.name == "ldaq") arg.name = "ldbq";
-            else if (arg.name == "ldbq") arg.name = "ldaq";
-        }
 
         package.arguments.push_back(std::move(arg));
     }
@@ -297,6 +296,8 @@ static inline micro::StructuredType::Type microType(Type T)
         CASE(u32)
         CASE(u16)
         CASE(u8)
+        CASE(s4)
+        CASE(u4)
         default: stub("Unsupported type");
     }
 #undef CASE
