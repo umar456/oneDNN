@@ -14,7 +14,7 @@
 * limitations under the License.
 *******************************************************************************/
 
-#include <oneapi/dnnl/experimental/dnnl_experimental.h>
+#include <common/sdpa.h>
 
 namespace dnnl {
 namespace experimental {

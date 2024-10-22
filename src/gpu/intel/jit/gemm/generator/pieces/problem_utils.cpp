@@ -37,6 +37,8 @@ void GEMMProblem::transpose()
     std::swap(aOffset, bOffset);
     std::swap(aoPtrDims, boPtrDims);
     std::swap(aScale2D, bScale2D);
+    std::swap(aqGroupM, bqGroupN);
+    std::swap(aqGroupK, bqGroupK);
     std::swap(sumA, sumB);
     std::swap(binaryRow, binaryCol);
     binaryTrans.flip();

@@ -18,10 +18,10 @@
 #define COMMON_SDPA_PD_HPP
 
 #include "oneapi/dnnl/dnnl.h"
-#include "oneapi/dnnl/experimental/dnnl_experimental.h"
 
 #include "common/c_types_map.hpp"
 #include "common/primitive_desc.hpp"
+#include "common/sdpa.h"
 #include "common/sdpa_utils.hpp"
 #include "common/utils.hpp"
 

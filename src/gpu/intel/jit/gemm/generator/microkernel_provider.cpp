@@ -46,11 +46,12 @@ static inline bool getStrategyByHeuristics(HW hw, GEMMStrategy &strategy, bool l
                                            GEMMProblem &problem, HWInformation hwInfo, SizeParams sizes,
                                            const std::vector<StrategyRequirement> &reqs);
 
-Package selectGEMMMicrokernel(GEMMProtocol protocol, HWInformation hwInfo, SizeParams sizes,
+Package selectGEMMMicrokernel(GEMMProtocol protocol_, HWInformation hwInfo, SizeParams sizes,
                               const GEMMProblem &problem_, const std::vector<StrategyRequirement> &reqs_,
                               void (*strategyAdjuster)(GEMMStrategy &strategy))
 {
     kcatalog::Catalog catalog;
+    GEMMProtocol protocol = protocol_;
 
     bool localA = protocol.options().localA;
     bool localB = protocol.options().localB;
@@ -75,12 +76,16 @@ Package selectGEMMMicrokernel(GEMMProtocol protocol, HWInformation hwInfo, SizeP
         problem.transpose();
         std::swap(localA, localB);
         std::swap(sizes.m, sizes.n);
+        std::swap(scaleA, scaleB);
+        std::swap(offsetA, offsetB);
+        //protocol.transpose();
         for (auto &req: reqs)
             req.transpose();
     }
 
-    if (scaleA != problem.aScale2D || scaleB != problem.bScale2D)
-        stub("Protocol scales do not match problem description");
+    std::cout << "problem: " << problem.toString() << std::endl;
+    //if (scaleA != problem.aScale2D || scaleB != problem.bScale2D)
+    //stub("Protocol scales do not match problem description");
     if (offsetA != (problem.aoPtrDims >= 0) || offsetB != (problem.boPtrDims >= 0))
         stub("Protocol offsets do not match problem description");
 
@@ -89,6 +94,7 @@ Package selectGEMMMicrokernel(GEMMProtocol protocol, HWInformation hwInfo, SizeP
     auto hw = getCore(product.family);
     auto stepping = hwInfo.gmdid & 0xFF;
 
+    std::cout << "problem: " << problem.toString() << std::endl;
     /* Create catalog matcher */
     MatchParams matchParams(hw, hwInfo.systolicAvailable, problem);
 
@@ -196,11 +202,11 @@ Package selectGEMMMicrokernel(GEMMProtocol protocol, HWInformation hwInfo, SizeP
     interface.newArgument("local_id_m", DataType::d);
     interface.newArgument("local_id_n", DataType::d);
     if (slmPtr)            interface.newArgument("slm_base", ExternalArgumentType::LocalPtr);
-    if (scaleA)            interface.newArgument("a_scale", DataType::d);
-    if (offsetA)           interface.newArgument("a_offset", DataType::d);
+    if (scaleA)            interface.newArgument("a_scale_ptr", ExternalArgumentType::GlobalPtr);
+    if (offsetA)           interface.newArgument("ao_ptr", ExternalArgumentType::GlobalPtr);
     if (scaleA || offsetA) interface.newArgument("ldaq", DataType::d);
-    if (scaleB)            interface.newArgument("b_scale", DataType::d);
-    if (offsetB)           interface.newArgument("b_offset", DataType::d);
+    if (scaleB)            interface.newArgument("b_scale_ptr", ExternalArgumentType::GlobalPtr);
+    if (offsetB)           interface.newArgument("bo_ptr", ExternalArgumentType::GlobalPtr);
     if (scaleB || offsetB) interface.newArgument("ldbq", DataType::d);
 
     /* Update problem from strategy */
@@ -215,7 +221,7 @@ Package selectGEMMMicrokernel(GEMMProtocol protocol, HWInformation hwInfo, SizeP
         BLASKernelGenerator<HW::arch> generator;                                    \
         generator.setStepping(stepping);                                            \
         return generator.gemmMicrokernelPackage(problem, strategy, interface,       \
-                                                protocol, hwInfo.gmdid, transC);    \
+                                                protocol_, hwInfo.gmdid, transC);    \
     }
 
     switch (hw) {

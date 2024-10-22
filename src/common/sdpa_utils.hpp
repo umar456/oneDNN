@@ -18,15 +18,19 @@
 #define COMMON_SDPA_UTILS_HPP
 
 #include "oneapi/dnnl/dnnl.h"
-
 #include "common/c_types_map.hpp"
 #include "common/nstl.hpp"
 #include "common/primitive_desc_iterator.hpp"
 #include "common/sdpa_types.hpp"
+#include "common/sdpa.h"
 #include "common/utils.hpp"
 
 namespace dnnl {
 namespace impl {
+
+#define VCHECK_SDPA(cond, msg, ...) \
+    VCONDCHECK(primitive, create, check, sdpa, (cond), \
+            status::invalid_arguments, msg, ##__VA_ARGS__);
 
 static inline sdpa_desc_t create_sdpa_desc(const memory_desc_t *q_md,
         const memory_desc_t *k_md, const memory_desc_t *v_md,
@@ -63,7 +67,18 @@ static inline status_t create_sdpa_pd(
     if (dst_md->dims[r] != q_md->dims[r] || dst_md->dims[c] != v_md->dims[c])
         return status::invalid_arguments;
 
+    if (attr == nullptr) attr = &default_attr();
+
     primitive_attr_t sdpa_attr = *attr;
+    auto zero_points = attr->zero_points_;
+    VCHECK_SDPA(IMPLICATION(!types::is_integral_dt(k_md->data_type),
+                        zero_points.has_default_values(DNNL_ARG_KEYS)),
+            VERBOSE_UNSUPPORTED_ZP_CFG);
+
+    VCHECK_SDPA(IMPLICATION(!types::is_integral_dt(v_md->data_type),
+                           zero_points.has_default_values(DNNL_ARG_VALUES)),
+            VERBOSE_UNSUPPORTED_ZP_CFG);
+
 
     primitive_desc_iterator_t it(
             engine, (op_desc_t *)&sdpa_desc, &sdpa_attr, nullptr);

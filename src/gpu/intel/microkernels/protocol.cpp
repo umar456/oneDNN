@@ -29,28 +29,19 @@ namespace micro {
 
 GEMMProtocol::GEMMProtocol(const Options &options) {
     family = Family::GEMM;
-    ioptions = 0;
-    if (options.localA) ioptions |= (1 << 0);
-    if (options.localB) ioptions |= (1 << 1);
-    if (options.addToC) ioptions |= (1 << 2);
-    if (options.slmPtr) ioptions |= (1 << 3);
-    if (options.offsetA) ioptions |= (1 << 4);
-    if (options.offsetB) ioptions |= (1 << 5);
-    if (options.scaleA) ioptions |= (1 << 6);
-    if (options.scaleB) ioptions |= (1 << 7);
+    ioptions = options.toOptionsMask();
 }
 
 GEMMProtocol::Options GEMMProtocol::options() const {
-    Options options {};
-    options.localA = (ioptions & (1 << 0));
-    options.localB = (ioptions & (1 << 1));
-    options.addToC = (ioptions & (1 << 2));
-    options.slmPtr = (ioptions & (1 << 3));
-    options.offsetA = (ioptions & (1 << 4));
-    options.offsetB = (ioptions & (1 << 5));
-    options.scaleA = (ioptions & (1 << 6));
-    options.scaleB = (ioptions & (1 << 7));
-    return options;
+    return Options(ioptions);
+}
+
+void GEMMProtocol::transpose() {
+    Options o(ioptions);
+    std::swap(o.localA, o.localB);
+    std::swap(o.offsetA, o.offsetB);
+    std::swap(o.scaleA, o.scaleB);
+    ioptions = o.toOptionsMask();
 }
 
 #define PDISPATCH(routine, cand) \
@@ -76,6 +67,18 @@ std::vector<ProtocolSetting> Protocol::settings() const {
 
 const char *GEMMProtocol::kernelBaseName() const {
     return "ugemm";
+}
+
+std::string GEMMProtocol::toString() const {
+    Options o = options();
+    std::string str(110, '\0');
+
+    sprintf(&str.front(),
+            "localA : %d, localB : %d, addToC : %d, slmPtr : %d, offsetA: %d,; "
+            "offsetB: %d,; scaleA : %d, scaleB : %d\n",
+            o.localA, o.localB, o.addToC, o.slmPtr, o.offsetA, o.offsetB,
+            o.scaleA, o.scaleB);
+    return str;
 }
 
 std::vector<ProtocolArgument> GEMMProtocol::arguments() const {
@@ -104,18 +107,25 @@ std::vector<ProtocolArgument> GEMMProtocol::arguments() const {
     std::vector<ProtocolArgument> argsV
             = {args, args + sizeof(args) / sizeof(args[0])};
 
-    if (options().localA) argsV[0].stype.format = LocalPointer;
-    if (options().localB) argsV[2].stype.format = LocalPointer;
-    if (options().addToC) argsV[4].direction = ProtocolArgument::InOut;
-    if (options().slmPtr) argsV.push_back({"slm", In, LocalPointer});
-    if (options().offsetA) argsV.push_back({"a_scale", In, GlobalPointer});
-    if (options().scaleA) argsV.push_back({"a_offset", In, GlobalPointer});
-    if (options().offsetA || options().scaleA)
-        argsV.push_back({"ldaq", In, s32});
-    if (options().offsetB) argsV.push_back({"b_scale", In, GlobalPointer});
-    if (options().scaleB) argsV.push_back({"b_offset", In, GlobalPointer});
-    if (options().offsetB || options().scaleB)
-        argsV.push_back({"ldbq", In, s32});
+    Options o = options();
+    printf("Options in arguments: %s\n", toString().c_str());
+
+    if (o.localA) argsV[0].stype.format = LocalPointer;
+    if (o.localB) argsV[2].stype.format = LocalPointer;
+    if (o.addToC) argsV[4].direction = ProtocolArgument::InOut;
+    if (o.slmPtr) argsV.push_back({"slm", In, LocalPointer});
+    if (o.scaleA) {
+      argsV.push_back({"a_scale_ptr", In, GlobalPointer});
+      argsV.back().stype.type = StructuredType::f16;
+    }
+    if (o.offsetA) argsV.push_back({"ao_ptr", In, GlobalPointer});
+    if (o.offsetA || o.scaleA) argsV.push_back({"ldaq", In, s32});
+    if (o.scaleB) {
+        argsV.push_back({"b_scale_ptr", In, GlobalPointer});
+        argsV.back().stype.type = StructuredType::f16;
+    }
+    if (o.offsetB) argsV.push_back({"bo_ptr", In, GlobalPointer});
+    if (o.offsetB || o.scaleB) { argsV.push_back({"ldbq", In, s32}); }
 
     return argsV;
 }
