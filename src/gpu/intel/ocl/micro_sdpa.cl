@@ -154,9 +154,20 @@ DECLARE_2D_TILE_RSELECT(a_scale_tile_type, SUBGROUP_SIZE, ugemm_vs_sg_tile_n, 1,
 #define binary_add(x, y) ((x) + (y))
 
 __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) kernel void
-micro_sdpa(const global half *K, const global half *Q, const global half *V,
+micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DATA_T *V,
         global half *A, global SCALE_DATA_T *scale_ptr, const global half *msk,
-        int d, int k, int q) {
+        int d, int k, int q
+#if defined(KEY_DT_S4) || defined(KEY_DT_S8)
+        , const global half* K_attr_scale
+        //, const global KEY_DATA_T* K_attr_zp
+        ,int ldkq
+        ,int group_size
+#endif
+#ifdef VAL_DT_S8
+        , const global half* V_attr_scale
+        //, const global VAL_DATA_T* V_attr_zp
+#endif
+        ) {
     uint sg_ij = sub_group_broadcast(get_local_id(1), 0);
     uint b0 = get_group_id(1);
     uint b1 = get_group_id(2);
@@ -198,11 +209,17 @@ micro_sdpa(const global half *K, const global half *Q, const global half *V,
     const bool need_sum_barrier = (ugemm_vs_barrier_count == 0);
 
     /* Locate K/Q/V/A matrices within batch */
-    K += KEY_OFF(b1, b0 / KV_GROUP_SIZE, 0, 0);
+    K += KEY_OFF(b1, b0, 0, 0);
     Q += QRY_OFF(b1, b0, 0, 0);
-    V += VAL_OFF(b1, b0 / KV_GROUP_SIZE, 0, 0);
+    V += VAL_OFF(b1, b0, 0, 0);
     A += DST_OFF(b1, b0, 0, 0, 0);
     msk += MSK_OFF(b1 % MSK_D0, b0 % MSK_D1, 0, 0);
+
+#if defined(KEY_DT_S4) || defined(KEY_DT_S8)
+    //TODO(umar): Hack offset. U
+    K_attr_scale += KEY_OFF(b1, b0, 0, 0) / group_size;
+#endif
+
 
     /* Load Q tile, destined for SLM */
     q_tile_type Q_tile;
@@ -296,10 +313,21 @@ micro_sdpa(const global half *K, const global half *Q, const global half *V,
                     : -INFINITY;
 #endif
 
+#if defined(KEY_DT_S4) || defined(KEY_DT_S8)
+       global half *K_scale = K_attr_scale + (k0 * ugemm_kq_wg_tile_m / group_size);
+#endif
+
         /* Calculate S = (K^T) * Q */
         s_tile_type S_tile
-                = ugemm_kq(K, ldk, Q_slm, D_MAX, k, ugemm_kq_wg_tile_n, d, k0,
-                        0, 0, sg_i_kq, sg_j_kq, (local char *)ugemm_slm);
+          = ugemm_kq(K, ldk, Q_slm, D_MAX, k, ugemm_kq_wg_tile_n, d, k0,
+                     0, 0, sg_i_kq, sg_j_kq, (local char *)ugemm_slm
+#if defined(KEY_DT_S4) || defined(KEY_DT_S8)
+                     , K_scale,
+                    // K_attr_zp,
+                     ldkq
+#endif
+                     );
+
 
         /* Apply attention mask */
 #if WITH_ATTN_MASK
@@ -448,9 +476,23 @@ micro_sdpa(const global half *K, const global half *Q, const global half *V,
 
         /* Accumulate A += V * S */
         int k_chunk = min(k - k0, ugemm_kq_wg_tile_m);
+
+
+#ifdef VAL_DT_S8
+        if(get_global_id(0) == 0 && get_global_id(1) == 0) {
+          printf("%p %f \n", V_attr_scale, *V_attr_scale);
+        }
+#endif
+
         a_tile_type A_tile1 = ugemm_vs(V, ldv, S_slm, ugemm_kq_wg_tile_m, d,
-                ugemm_kq_wg_tile_n, k_chunk, 0, 0, 0, sg_i_vs, sg_j_vs,
-                (local char *)ugemm_slm);
+                                       ugemm_kq_wg_tile_n, k_chunk, 0, 0, 0, sg_i_vs, sg_j_vs,
+                                       (local char *)ugemm_slm
+#ifdef VAL_DT_S8
+                                       , V_attr_scale, //V_attr_zp,
+                                       1
+#endif
+                                       );
+
         V += ldv * ugemm_kq_wg_tile_m;
         tile_binary(A_tile, A_tile1, binary_add);
     }

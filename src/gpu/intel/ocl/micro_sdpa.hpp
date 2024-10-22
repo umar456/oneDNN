@@ -52,8 +52,6 @@ struct micro_sdpa_t : public gpu_primitive_t {
             using namespace data_type;
             using smask_t = primitive_attr_t::skip_mask_t;
 
-            VDISPATCH_SDPA(attr()->has_default_values(smask_t::scales_runtime),
-                    VERBOSE_UNSUPPORTED_ATTR);
             VDISPATCH_SDPA(
                     utils::everyone_is(4, qry_md()->ndims, key_md()->ndims,
                             val_md()->ndims, dst_md()->ndims),
@@ -69,8 +67,14 @@ struct micro_sdpa_t : public gpu_primitive_t {
                         VERBOSE_INVALID_BROADCAST, "attn_mask", mask_k_index);
             }
             VDISPATCH_SDPA(utils::everyone_is(data_type::f16,
-                                   qry_md()->data_type, key_md()->data_type,
-                                   val_md()->data_type, dst_md()->data_type),
+                                   qry_md()->data_type, dst_md()->data_type),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_SDPA(
+                    utils::one_of(this->key_md()->data_type, data_type::f16,
+                            data_type::s8, data_type::s4),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_SDPA(utils::one_of(this->val_md()->data_type,
+                                   data_type::f16, data_type::s8),
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_SDPA(set_default_formats() == status::success,
                     VERBOSE_UNSUPPORTED_TAG);

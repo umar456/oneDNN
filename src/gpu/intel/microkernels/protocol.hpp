@@ -18,6 +18,7 @@
 #define GPU_MICROKERNELS_PROTOCOL_HPP
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace dnnl {
@@ -57,12 +58,38 @@ public:
         bool offsetB = false;
         bool scaleA = false;
         bool scaleB = false;
+
+        Options() = default;
+        explicit Options(int flags)
+            : localA(flags & (1 << 0))
+            , localB(flags & (1 << 1))
+            , addToC(flags & (1 << 2))
+            , slmPtr(flags & (1 << 3))
+            , offsetA(flags & (1 << 4))
+            , offsetB(flags & (1 << 5))
+            , scaleA(flags & (1 << 6))
+            , scaleB(flags & (1 << 7)) {}
+
+        int toOptionsMask() const {
+            int ioptions = 0;
+            if (localA) ioptions |= (1 << 0);
+            if (localB) ioptions |= (1 << 1);
+            if (addToC) ioptions |= (1 << 2);
+            if (slmPtr) ioptions |= (1 << 3);
+            if (offsetA) ioptions |= (1 << 4);
+            if (offsetB) ioptions |= (1 << 5);
+            if (scaleA) ioptions |= (1 << 6);
+            if (scaleB) ioptions |= (1 << 7);
+            return ioptions;
+        }
     };
 
     GEMMProtocol() : GEMMProtocol(Options {}) {}
     GEMMProtocol(const Options &options);
 
     Options options() const;
+    void transpose();
+    std::string toString() const;
 
 protected:
     friend class Protocol;
@@ -82,6 +109,8 @@ struct StructuredType {
         s16,
         u8,
         s8, //    integral
+        u4,
+        s4, //    integral
         f64,
         f32,
         f16,

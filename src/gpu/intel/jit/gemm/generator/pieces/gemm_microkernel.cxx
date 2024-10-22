@@ -224,14 +224,20 @@ micro::Package BLASKernelGenerator<hw>::gemmMicrokernelPackage(const GEMMProblem
             arg.sizes.block[0] = blockM;
             arg.sizes.block[1] = blockN;
         } else {
-            const char *aname = parg.name;
+            const char *aname = arg.name.c_str();
+
+            if (transposeC) {
+                if (arg.name == "a_scale_ptr") arg.name = "b_scale_ptr";
+                else if (arg.name == "b_scale_ptr") arg.name = "a_scale_ptr";
+                else if (arg.name == "ao_ptr") arg.name = "bo_ptr";
+                else if (arg.name == "bo_ptr") arg.name = "ao_ptr";
+                else if (arg.name == "ldaq") arg.name = "ldbq";
+                else if (arg.name == "ldbq") arg.name = "ldaq";
+            }
+
             if (arg.name == "a") aname = "A";
             if (arg.name == "b") aname = "B";
             if (arg.name == "slm") aname = "slm_base";
-            if (arg.name == "a_offset") aname = "ao_ptr";
-            if (arg.name == "b_offset") aname = "bo_ptr";
-            if (arg.name == "a_scale") aname = "a_scale_ptr";
-            if (arg.name == "b_scale") aname = "b_scale_ptr";
             auto reg = interface.getArgument(aname);
             arg.location.resize(1);
             arg.location[0].boffset = reg.getBase() * GRF::bytes(hw) + reg.getByteOffset();
@@ -241,6 +247,8 @@ micro::Package BLASKernelGenerator<hw>::gemmMicrokernelPackage(const GEMMProblem
         if (arg.name == "a") arg.actualType = microType(problem.Ta_ext);
         if (arg.name == "b") arg.actualType = microType(problem.Tb_ext);
         if (arg.name == "c") arg.actualType = microType(problem.Tc);
+        if (arg.name == "a_scale_ptr") arg.actualType = microType(problem.Ta_scale);
+        if (arg.name == "b_scale_ptr") arg.actualType = microType(problem.Tb_scale);
 
         if (transposeC) {
             if (arg.name == "a") arg.name = "b";
@@ -253,10 +261,10 @@ micro::Package BLASKernelGenerator<hw>::gemmMicrokernelPackage(const GEMMProblem
             else if (arg.name == "j0") arg.name = "i0";
             else if (arg.name == "local_id_m") arg.name = "local_id_n";
             else if (arg.name == "local_id_n") arg.name = "local_id_m";
-            else if (arg.name == "a_scale") arg.name = "b_scale";
-            else if (arg.name == "b_scale") arg.name = "a_scale";
-            else if (arg.name == "a_offset") arg.name = "b_offset";
-            else if (arg.name == "b_offset") arg.name = "a_offset";
+            else if (arg.name == "a_scale_ptr") arg.name = "b_scale_ptr";
+            else if (arg.name == "b_scale_ptr") arg.name = "a_scale_ptr";
+            else if (arg.name == "ao_ptr") arg.name = "bo_ptr";
+            else if (arg.name == "bo_ptr") arg.name = "ao_ptr";
             else if (arg.name == "ldaq") arg.name = "ldbq";
             else if (arg.name == "ldbq") arg.name = "ldaq";
         }
@@ -297,6 +305,8 @@ static inline micro::StructuredType::Type microType(Type T)
         CASE(u32)
         CASE(u16)
         CASE(u8)
+        CASE(s4)
+        CASE(u4)
         default: stub("Unsupported type");
     }
 #undef CASE

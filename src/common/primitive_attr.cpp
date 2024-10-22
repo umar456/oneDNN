@@ -86,8 +86,8 @@ int zero_points_t::get(int arg) const {
 
 status_t zero_points_t::set(int arg, int mask, int ndims, const dims_t groups,
         data_type_t data_type) {
-    const bool supported_arg
-            = utils::one_of(arg, DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST);
+    const bool supported_arg = utils::one_of(
+                                             arg, DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST, DNNL_ARG_SRC_1, DNNL_ARG_SRC_2);
     if (!supported_arg) return status::unimplemented;
 
     switch (arg) {

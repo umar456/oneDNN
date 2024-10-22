@@ -14,7 +14,7 @@
 * limitations under the License.
 *******************************************************************************/
 
-#include <oneapi/dnnl/experimental/dnnl_experimental.h>
+#include <common/sdpa.h>
 
 #include "opdesc.hpp"
 #include "primitive_desc_iface.hpp"
