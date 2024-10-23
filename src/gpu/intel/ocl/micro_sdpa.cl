@@ -157,10 +157,12 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) kernel void
 micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DATA_T *V,
         global half *A, global SCALE_DATA_T *scale_ptr, const global half *msk,
         int d, int k, int q
+// PC: don't hardcode by data type -- use a separate macro to check for presence of scales/zp
 #if defined(KEY_DT_S4) || defined(KEY_DT_S8)
         , const global half* K_attr_scale
         //, const global KEY_DATA_T* K_attr_zp
         ,int ldkq
+// PC: group size is hard-coded into the microkernel and should be defined as a macro here
         ,int group_size
 #endif
 #ifdef VAL_DT_S8
@@ -217,6 +219,7 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
 
 #if defined(KEY_DT_S4) || defined(KEY_DT_S8)
     //TODO(umar): Hack offset. U
+    // PC: check this
     K_attr_scale += KEY_OFF(b1, b0, 0, 0) / group_size;
 #endif
 
@@ -314,6 +317,7 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
 #endif
 
 #if defined(KEY_DT_S4) || defined(KEY_DT_S8)
+        // PC: use macro to do the offseting
        global half *K_scale = K_attr_scale + (k0 * ugemm_kq_wg_tile_m / group_size);
 #endif
 

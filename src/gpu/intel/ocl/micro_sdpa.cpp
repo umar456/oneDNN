@@ -215,8 +215,8 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
 
         problem_kq.Ta = Type::f16;
         problem_kq.aScale2D = true;
-        problem_kq.aqGroupM = scales.group_dims_[3];
-        problem_kq.aqGroupK = 1;
+        problem_kq.aqGroupM = 1;
+        problem_kq.aqGroupK = scales.group_dims_[3];
 
         // problem_kq.Tao = Type::s32;
         //problem_kq.aoPtrDims = 1;
