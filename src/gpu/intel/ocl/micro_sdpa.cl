@@ -329,7 +329,7 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
 #endif
                      );
 
-#if 1
+#if 0
         if (k0 == 0 && sg_i_kq == 0 && sg_j_kq == 0 && get_sub_group_local_id() == 0) {
             printf("ldk = %d\n", (int) ldk);
             for (int i = 0; i < 4; i++) {
