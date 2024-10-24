@@ -36,14 +36,6 @@ GEMMProtocol::Options GEMMProtocol::options() const {
     return Options(ioptions);
 }
 
-void GEMMProtocol::transpose() {
-    Options o(ioptions);
-    std::swap(o.localA, o.localB);
-    std::swap(o.offsetA, o.offsetB);
-    std::swap(o.scaleA, o.scaleB);
-    ioptions = o.toOptionsMask();
-}
-
 #define PDISPATCH(routine, cand) \
     if (family == Family::cand) \
     return reinterpret_cast<const cand##Protocol *>(this)->routine()
@@ -67,18 +59,6 @@ std::vector<ProtocolSetting> Protocol::settings() const {
 
 const char *GEMMProtocol::kernelBaseName() const {
     return "ugemm";
-}
-
-std::string GEMMProtocol::toString() const {
-    Options o = options();
-    std::string str(110, '\0');
-
-    sprintf(&str.front(),
-            "localA : %d, localB : %d, addToC : %d, slmPtr : %d, offsetA: %d,; "
-            "offsetB: %d,; scaleA : %d, scaleB : %d\n",
-            o.localA, o.localB, o.addToC, o.slmPtr, o.offsetA, o.offsetB,
-            o.scaleA, o.scaleB);
-    return str;
 }
 
 std::vector<ProtocolArgument> GEMMProtocol::arguments() const {
@@ -107,24 +87,17 @@ std::vector<ProtocolArgument> GEMMProtocol::arguments() const {
     std::vector<ProtocolArgument> argsV
             = {args, args + sizeof(args) / sizeof(args[0])};
 
-    Options o = options();
-    printf("Options in arguments: %s\n", toString().c_str());
+    auto o = options();
 
     if (o.localA) argsV[0].stype.format = LocalPointer;
     if (o.localB) argsV[2].stype.format = LocalPointer;
     if (o.addToC) argsV[4].direction = ProtocolArgument::InOut;
     if (o.slmPtr) argsV.push_back({"slm", In, LocalPointer});
-    if (o.scaleA) {
-      argsV.push_back({"a_scale_ptr", In, GlobalPointer});
-      argsV.back().stype.type = StructuredType::f16;
-    }
-    if (o.offsetA) argsV.push_back({"ao_ptr", In, GlobalPointer});
+    if (o.scaleA) argsV.push_back({"a_scale", In, GlobalPointer});
+    if (o.offsetA) argsV.push_back({"a_offset", In, GlobalPointer});
     if (o.offsetA || o.scaleA) argsV.push_back({"ldaq", In, s32});
-    if (o.scaleB) {
-        argsV.push_back({"b_scale_ptr", In, GlobalPointer});
-        argsV.back().stype.type = StructuredType::f16;
-    }
-    if (o.offsetB) argsV.push_back({"bo_ptr", In, GlobalPointer});
+    if (o.scaleB) argsV.push_back({"b_scale", In, GlobalPointer});
+    if (o.offsetB) argsV.push_back({"b_offset", In, GlobalPointer});
     if (o.offsetB || o.scaleB) { argsV.push_back({"ldbq", In, s32}); }
 
     return argsV;

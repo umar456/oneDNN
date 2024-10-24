@@ -197,26 +197,24 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
 
     /* Set up GEMMProblem structure for first GEMM: K^T * Q */
     GEMMProblem problem;
-    problem.Ta = problem.Ta_ext
+    problem.Ta_ext
             = jit::convert_dnnl_to_kernel_type(key_md()->data_type);
-    problem.Tb = problem.Tb_ext
+    problem.Tb_ext
             = jit::convert_dnnl_to_kernel_type(qry_md()->data_type);
+    problem.Ta = problem.Tb = Type::f16;
     problem.Tc = problem.Tc_ext = Type::f32;
     problem.Ts = problem.Tc;
 
     auto problem_kq = problem;
     problem_kq.A.layout = convert_dnnl_to_kernel_layout(key_md());
-    if (utils::one_of(key_md()->data_type, dnnl_s4, dnnl_s8)) {
+    if (with_key_scales()) {
         problem_kq.Ta_scale = Type::f16;
         problem_kq.A_scale.alignment = int(types::data_type_size(data_type::f16));
-        problem_kq.A_scale.layout = MatrixLayout::N;
+        problem_kq.A_scale.layout = MatrixLayout::T;
 
-        auto scales = attr()->scales_.get(DNNL_ARG_KEYS);
-
-        problem_kq.Ta = Type::f16;
         problem_kq.aScale2D = true;
         problem_kq.aqGroupM = 1;
-        problem_kq.aqGroupK = scales.group_dims_[3];
+        problem_kq.aqGroupK = key_group_size();
 
         // problem_kq.Tao = Type::s32;
         //problem_kq.aoPtrDims = 1;
@@ -247,10 +245,7 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     micro::GEMMProtocol::Options opts_kq;
     opts_kq.localB = true;
     opts_kq.slmPtr = true;
-    if (utils::one_of(key_md()->data_type, dnnl_s4, dnnl_s8)) {
-        opts_kq.scaleA = true;
-        //opts_kq.offsetA = true;
-    }
+    opts_kq.scaleA = with_key_scales();
 
     /* Ask microkernel provider for microkernel */
     try {
@@ -260,25 +255,19 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
 
     /* Update for second GEMM: V*S */
     auto problem_vs = problem;
-    problem_vs.Ta = problem_vs.Ta_ext
+    problem_vs.Ta_ext
             = jit::convert_dnnl_to_kernel_type(val_md()->data_type);
     problem_vs.A.layout = convert_dnnl_to_kernel_layout(val_md());
 
-    if (val_md()->data_type == dnnl_s8) {
+    if (with_value_scales()) {
         problem_vs.Ta_scale = Type::f16;
         problem_vs.A_scale.alignment = int(types::data_type_size(data_type::f16));
         problem_vs.A_scale.layout = MatrixLayout::N;
 
-        problem_vs.Ta = Type::f16;
         problem_vs.aScale2D = true;
         //problem_vs.aoPtrDims = 1;
 
-        auto scales = attr()->scales_.get(DNNL_ARG_VALUES);
-        printf("VAL_GROUPS = %ld, %ld,  %ld, %ld\n", scales.group_dims_[0],
-                scales.group_dims_[1], scales.group_dims_[2],
-                scales.group_dims_[3]);
-
-        problem_vs.aqGroupM = scales.group_dims_[3];
+        problem_vs.aqGroupM = value_group_size();
         problem_vs.aqGroupK = 1;
         //problem_vs.bqGroupK = 1;
         //problem_vs.bqGroupK = 1;
@@ -288,19 +277,15 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
         //problem_vs.aoPtrDims = 0;
     }
 
-
-
     problem_vs.B.layout = MatrixLayout::Pr;
     problem_vs.C.layout = MatrixLayout::N;
     problem_vs.A.setAlignment(alignmentForLD(d->head_size() * problem.Ta));
     problem_vs.B.setAlignment(64); // S is packed in SLM
     problem_vs.B.crosspack = 16;
-    printf("kq sizes: %ld %ld %ld\n", sizes.m, sizes.n, sizes.k);
     sizes.m = d->values();
     sizes.n = gemm_kq_.getSetting("wg_tile_n");
     sizes.k = gemm_kq_.getSetting("wg_tile_m");
 
-    printf("vs sizes: %ld %ld %ld\n", sizes.m, sizes.n, sizes.k);
     /* Set up microkernel strategy */
     std::vector<StrategyRequirement> reqs_vs;
     reqs_vs.push_back(StrategyRequirement::UnrollM == config->unroll_m_vs);
@@ -311,10 +296,7 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     micro::GEMMProtocol::Options opts_vs;
     opts_vs.localB = true;
     opts_vs.slmPtr = true;
-    if (val_md()->data_type == dnnl_s8) {
-        opts_vs.scaleA = true;
-        //opts_vs.offsetA = true;
-    }
+    opts_vs.scaleA = with_value_scales();
 
     /* Ask microkernel provider for microkernel */
     try {
@@ -335,7 +317,6 @@ status_t micro_sdpa_t::init(impl::engine_t *engine) {
     compute::kernel_ctx_t kernel_ctx;
 
     auto *d = pd()->desc();
-    auto *attr = pd()->attr();
 
     kernel_ctx.set_data_type(pd()->dst_md()->data_type);
 
@@ -376,6 +357,14 @@ status_t micro_sdpa_t::init(impl::engine_t *engine) {
 
     kernel_ctx.define_int("TRANSPOSE_K",
             gemm_desc_t::get_trans(*pd()->key_md()) == dnnl_trans);
+
+    kernel_ctx.define_int("WITH_KEY_SCALES", pd()->with_key_scales());
+    kernel_ctx.define_int("WITH_VAL_SCALES", pd()->with_value_scales());
+
+    if (pd()->with_key_scales())
+        kernel_ctx.define_int("KEY_GROUP_SIZE", pd()->key_group_size());
+    if (pd()->with_value_scales())
+        kernel_ctx.define_int("VAL_GROUP_SIZE", pd()->value_group_size());
 
     def_data_type(kernel_ctx, d->scale_dt, "SCALE");
     kernel_ctx.define_int("INVERT_SCALE", d->invert_scale);
@@ -480,22 +469,10 @@ status_t micro_sdpa_t::execute(const exec_ctx_t &ctx) const {
     arg_list.set(8, (int)Q);
     int nargs = 9;
 
-    if (key_scales) arg_list.set(nargs++, key_scales);
-    if (key_zp) arg_list.set(nargs++, key_zp);
-    if (key_scales || key_zp) {
-        int group_size
-                = pd()->attr()->scales_.get(DNNL_ARG_KEYS).group_dims_[3];
-        int num_groups = pd()->desc()->keys() / group_size;
-        const dim_t ldkq = num_groups;
-        arg_list.set(nargs++, (int)ldkq);
-        arg_list.set(nargs++, (int)group_size);
-    }
-    if (value_scales) arg_list.set(10, value_scales);
-    //if (value_zp) arg_list.set(12, value_zp);
-    printf("ks %d\n", (bool)key_scales);
-    printf("kzp %d\n", (bool)key_zp);
-    printf("vs %d\n", (bool)value_scales);
-    printf("vzp %d\n", (bool)value_zp);
+    if (pd()->with_key_scales()) arg_list.set(nargs++, key_scales);
+    // if (key_zp) arg_list.set(nargs++, key_zp);
+    if (pd()->with_value_scales()) arg_list.set(nargs++, value_scales);
+    // if (wei_zp) ...
 
     compute::range_t lws = {(size_t)pd()->sg_size(), (size_t)sg_per_wg, 1};
     compute::range_t gws = lws;
@@ -505,9 +482,6 @@ status_t micro_sdpa_t::execute(const exec_ctx_t &ctx) const {
     gws[2] *= pd()->dst_md()->dims[0];
 
     auto nd_range = compute::nd_range_t(gws, lws);
-
-    std:: cout << "nd_range: " << nd_range.str() << std::endl;
-
     return parallel_for(ctx, nd_range, kernel_, arg_list);
 }
 

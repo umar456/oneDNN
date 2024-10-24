@@ -157,22 +157,17 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) kernel void
 micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DATA_T *V,
         global half *A, global SCALE_DATA_T *scale_ptr, const global half *msk,
         int d, int k, int q
-// PC: don't hardcode by data type -- use a separate macro to check for presence of scales/zp
-#if defined(KEY_DT_S4) || defined(KEY_DT_S8)
-        , const global half* K_attr_scale
-        //, const global KEY_DATA_T* K_attr_zp
-        ,int ldkq
-// PC: group size is hard-coded into the microkernel and should be defined as a macro here
-        ,int group_size
+#if WITH_KEY_SCALES
+        , const global half *K_scales
 #endif
-#ifdef VAL_DT_S8
-        , const global half* V_attr_scale
-        //, const global VAL_DATA_T* V_attr_zp
+#if WITH_VAL_SCALES
+        , const global half *V_scales
 #endif
         ) {
     uint sg_ij = sub_group_broadcast(get_local_id(1), 0);
     uint b0 = get_group_id(1);
     uint b1 = get_group_id(2);
+    uint b0_kv = b0 / KV_GROUP_SIZE;
 
     uint wg_j0 = get_group_id(0) * ugemm_kq_wg_tile_n;
 
@@ -181,6 +176,13 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
     uint ldq = QRY_S2;
     uint ldv = VAL_S2;
     uint lda = DST_S2;
+
+#if WITH_KEY_SCALES
+    uint ldkq = div_up(d, KEY_GROUP_SIZE);
+#endif
+#if WITH_VALUE_SCALES
+    uint ldvq = div_up(d, VALUE_GROUP_SIZE);
+#endif
 
     /* Subgroup IDs for each GEMM */
     uint sg_i_kq = sg_ij % ugemm_kq_sg_per_wg_m;
@@ -211,18 +213,20 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
     const bool need_sum_barrier = (ugemm_vs_barrier_count == 0);
 
     /* Locate K/Q/V/A matrices within batch */
-    K += KEY_OFF(b1, b0, 0, 0);
-    Q += QRY_OFF(b1, b0, 0, 0);
-    V += VAL_OFF(b1, b0, 0, 0);
+
+    K += KEY_OFF(b1, b0_kv, 0, 0);
+    Q += QRY_OFF(b1, b0,    0, 0);
+    V += VAL_OFF(b1, b0_kv, 0, 0);
     A += DST_OFF(b1, b0, 0, 0, 0);
     msk += MSK_OFF(b1 % MSK_D0, b0 % MSK_D1, 0, 0);
 
-#if defined(KEY_DT_S4) || defined(KEY_DT_S8)
-    //TODO(umar): Hack offset. U
-    // PC: check this
-    K_attr_scale += KEY_OFF(b1, b0, 0, 0) / group_size;
+#if WITH_KEY_SCALES
+        // TODO: support b0/b1 broadcast
+    //K_scales += (b1 * KEY_S1 + b0_kv) * (KEY_S2 * KEY_S3 / KEY_GROUP_SIZE);
 #endif
-
+#if WITH_VAL_SCALES
+    V_scales += (b1 * VAL_S1 + b0_kv) * (VAL_S2 * VAL_S3 / VAL_GROUP_SIZE);
+#endif
 
     /* Load Q tile, destined for SLM */
     q_tile_type Q_tile;
@@ -316,19 +320,12 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
                     : -INFINITY;
 #endif
 
-#if defined(KEY_DT_S4) || defined(KEY_DT_S8)
-        // PC: use macro to do the offseting
-       global half *K_scale = K_attr_scale + (k0 * ugemm_kq_wg_tile_m / group_size);
-#endif
-
         /* Calculate S = (K^T) * Q */
         s_tile_type S_tile
           = ugemm_kq(K, ldk, Q_slm, D_MAX, k, ugemm_kq_wg_tile_n, d, k0,
                      0, 0, sg_i_kq, sg_j_kq, (local char *)ugemm_slm
-#if defined(KEY_DT_S4) || defined(KEY_DT_S8)
-                     , K_scale,
-                    // K_attr_zp,
-                     ldkq
+#if WITH_KEY_SCALES
+                     , K_scales, ldkq
 #endif
                      );
 
@@ -481,19 +478,15 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
         /* Accumulate A += V * S */
         int k_chunk = min(k - k0, ugemm_kq_wg_tile_m);
 
-
-#ifdef VAL_DT_S8
-        if(get_global_id(0) == 0 && get_global_id(1) == 0) {
-          printf("%p %f \n", V_attr_scale, *V_attr_scale);
-        }
+#if WITH_VAL_SCALES
+        /* use i0 below to get correct V_scale offset */
 #endif
 
         a_tile_type A_tile1 = ugemm_vs(V, ldv, S_slm, ugemm_kq_wg_tile_m, d,
                                        ugemm_kq_wg_tile_n, k_chunk, 0, 0, 0, sg_i_vs, sg_j_vs,
                                        (local char *)ugemm_slm
-#ifdef VAL_DT_S8
-                                       , V_attr_scale, //V_attr_zp,
-                                       1
+#if WITH_VAL_SCALES
+                                       , V_scales, ldvq
 #endif
                                        );
 

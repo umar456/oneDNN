@@ -98,7 +98,6 @@ struct sdpa_pd_t : public primitive_desc_t {
     bool with_attn_scale() const {
         return (desc_.scale_dt != data_type::undef);
     }
-
     bool with_attn_mask() const {
         return (attn_mask_md()->data_type != data_type::undef);
     }

@@ -71,10 +71,10 @@ struct micro_sdpa_t : public gpu_primitive_t {
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_SDPA(
                     utils::one_of(this->key_md()->data_type, data_type::f16,
-                            data_type::s8, data_type::s4),
+                            data_type::u8, data_type::s8, data_type::u4, data_type::s4),
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_SDPA(utils::one_of(this->val_md()->data_type,
-                                   data_type::f16, data_type::s8),
+                                   data_type::f16, data_type::u8, data_type::s8, data_type::u4, data_type::s4),
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_SDPA(set_default_formats() == status::success,
                     VERBOSE_UNSUPPORTED_TAG);
@@ -115,6 +115,24 @@ struct micro_sdpa_t : public gpu_primitive_t {
             for (int i = 32; i <= 1024; i *= 2)
                 if (head_size <= i) return i;
             return head_size;
+        }
+
+        bool with_key_scales() const {
+            return (attr()->scales_.get(DNNL_ARG_KEYS).ndims_ >= 2);
+        }
+        bool with_value_scales() const {
+            return (attr()->scales_.get(DNNL_ARG_VALUES).ndims_ >= 2);
+        }
+
+        dim_t key_group_size() const {
+            if (with_key_scales())
+                return attr()->scales_.get(DNNL_ARG_KEYS).group_dims_[2];
+            return 0;
+        }
+        dim_t value_group_size() const {
+            if (with_value_scales())
+                return attr()->scales_.get(DNNL_ARG_VALUES).group_dims_[3];
+            return 0;
         }
 
         compute::gpu_arch_t arch() const { return arch_; }

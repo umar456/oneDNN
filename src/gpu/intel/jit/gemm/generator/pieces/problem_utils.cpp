@@ -50,6 +50,8 @@ void GEMMProblem::transpose()
     AO.transpose();
     BO.transpose();
     CO.transpose();
+    A_scale.transpose();
+    B_scale.transpose();
 }
 
 static inline void append(std::ostringstream &ss, const Scalar &x);

@@ -18,7 +18,6 @@
 #define GPU_MICROKERNELS_PROTOCOL_HPP
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
 namespace dnnl {
@@ -88,8 +87,6 @@ public:
     GEMMProtocol(const Options &options);
 
     Options options() const;
-    void transpose();
-    std::string toString() const;
 
 protected:
     friend class Protocol;
@@ -108,7 +105,7 @@ struct StructuredType {
         u16,
         s16,
         u8,
-        s8, //    integral
+        s8,
         u4,
         s4, //    integral
         f64,
