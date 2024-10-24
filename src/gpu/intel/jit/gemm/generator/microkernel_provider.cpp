@@ -81,7 +81,7 @@ Package selectGEMMMicrokernel(GEMMProtocol protocol, HWInformation hwInfo, SizeP
             req.transpose();
     }
 
-    std::cout << "problem: " << problem.toString() << std::endl;
+    std::cout << "         -- problem: " << problem.toString() << std::endl;
 
     if (scaleA != problem.aScale2D || scaleB != problem.bScale2D)
         stub("Protocol scales do not match problem description");

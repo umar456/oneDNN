@@ -262,8 +262,8 @@ micro::Package BLASKernelGenerator<hw>::gemmMicrokernelPackage(const GEMMProblem
         }
 
         /* Provide actual argument types */
-        if (iname == "a") arg.actualType = microType(problem.Ta_ext);
-        if (iname == "b") arg.actualType = microType(problem.Tb_ext);
+        if (iname == "A") arg.actualType = microType(problem.Ta_ext);
+        if (iname == "B") arg.actualType = microType(problem.Tb_ext);
         if (iname == "c") arg.actualType = microType(problem.Tc);
         if (iname == "ao_ptr") arg.actualType = microType(problem.Tao);
         if (iname == "bo_ptr") arg.actualType = microType(problem.Tbo);

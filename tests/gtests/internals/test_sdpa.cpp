@@ -112,7 +112,7 @@ inline void write_to_dnnl_memory(const T *handle, dnnl::memory &mem,
             dnnl::stream s(eng);
             memory mem_f32_mem(
                     {mem.get_desc().get_dims(), memory::data_type::f32,
-                            memory::format_tag::abcd},
+                            mem.get_desc().get_strides()},
                     eng);
             write_to_dnnl_memory<float>((const float*)handle, mem_f32_mem, attr, scale_attr);
 
@@ -443,13 +443,17 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
     auto &Q = query_data;
     auto &K = key_quantized_data;
     auto &V = val_quantized_data;
+    auto &Ks = key_scale_data;
     auto d = p.head_size;
     auto k = p.seq_len;
     auto q = p.query_num;
 
     int kr = -1, kc = -1, qr = -1, qc = -1, vr = -1, vc = -1, xb = 0;
+    int ksr = -1, ksc = -1;
     if (getenv("KR")) kr = atoi(getenv("KR"));
     if (getenv("KC")) kc = atoi(getenv("KC"));
+    if (getenv("KSR")) ksr = atoi(getenv("KSR"));
+    if (getenv("KSC")) ksc = atoi(getenv("KSC"));
     if (getenv("QR")) qr = atoi(getenv("QR"));
     if (getenv("QC")) qc = atoi(getenv("QC"));
     if (getenv("VR")) vr = atoi(getenv("VR"));
@@ -468,6 +472,12 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
             for (auto &k: K) k = 0;
             K[xb*d*k + kr*d + kc] = 1;
         }
+    }
+    if (ksr >= 0 || ksc >= 0) {
+        ksr = std::max(ksr, 0);
+        ksc = std::max(ksc, 0);
+        for (auto &ks: Ks) ks = 0;
+        Ks[(xb*d*k + ksr*d)/p.group_size + ksc] = 1;
     }
     if (qr >= 0 || qc >= 0) {
         qr = std::max(qr, 0);
@@ -810,7 +820,7 @@ TEST(SDPA, compares8tof16) {
                             + j * strides[2] + i * strides[3];
                     auto o_f16 = mapped_ptr_f16[offset].f();
                     auto o_s8 = mapped_ptr_s8[offset].f();
-                    if (std::abs(o_f16 - o_s8) > 0.0003f && mismatches++ < 20)
+                    if (o_f16 != o_s8 && mismatches++ < 20)
                         fprintf(stderr, "Mismatch at (%d,%d,%d,%d): computed %f vs. %f\n", l, k, j, i, o_s8, o_f16);
                 }
             }
