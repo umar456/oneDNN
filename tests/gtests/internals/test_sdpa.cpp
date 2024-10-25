@@ -758,7 +758,7 @@ TEST(SDPA, compares8tof16) {
 
     memory::data_type dt = memory::data_type::f16;
     memory::data_type kdt = memory::data_type::s8;
-    memory::data_type vdt = memory::data_type::s8;
+    memory::data_type vdt = memory::data_type::s4;
     memory::data_type scale_dt = memory::data_type::f16;
     bool invert_scale = false;
 

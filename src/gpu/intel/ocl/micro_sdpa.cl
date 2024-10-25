@@ -151,6 +151,18 @@ DECLARE_2D_TILE_RSELECT(a_scale_tile_type, SUBGROUP_SIZE, ugemm_vs_sg_tile_n, 1,
     tile_store_block(t, ptr, ld, off_r, off_c)
 #endif
 
+#if defined(KEY_DT_U4) || defined(KEY_DT_S4)
+#define KEY_ELEMENTS_PER_BYTE 2
+#else
+#define KEY_ELEMENTS_PER_BYTE 1
+#endif
+
+#if defined(VAL_DT_U4) || defined(VAL_DT_S4)
+#define VAL_ELEMENTS_PER_BYTE 2
+#else
+#define VAL_ELEMENTS_PER_BYTE 1
+#endif
+
 #define binary_add(x, y) ((x) + (y))
 
 __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) kernel void
@@ -214,9 +226,9 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
 
     /* Locate K/Q/V/A matrices within batch */
 
-    K += KEY_OFF(b1, b0_kv, 0, 0);
+    K += KEY_OFF(b1, b0_kv, 0, 0) / KEY_ELEMENTS_PER_BYTE;
     Q += QRY_OFF(b1, b0,    0, 0);
-    V += VAL_OFF(b1, b0_kv, 0, 0);
+    V += VAL_OFF(b1, b0_kv, 0, 0) / VAL_ELEMENTS_PER_BYTE;
     A += DST_OFF(b1, b0, 0, 0, 0);
     msk += MSK_OFF(b1 % MSK_D0, b0 % MSK_D1, 0, 0);
 
@@ -496,7 +508,7 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
 #endif
                                        );
 
-        V += ldv * ugemm_kq_wg_tile_m;
+        V += ldv * ugemm_kq_wg_tile_m / VAL_ELEMENTS_PER_BYTE;
 #if WITH_VAL_SCALES
         V_scales += ldvq * ugemm_kq_wg_tile_m;
 #endif
