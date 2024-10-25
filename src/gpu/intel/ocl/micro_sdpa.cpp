@@ -215,9 +215,6 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
         problem_kq.aScale2D = true;
         problem_kq.aqGroupM = 1;
         problem_kq.aqGroupK = key_group_size();
-
-        // problem_kq.Tao = Type::s32;
-        //problem_kq.aoPtrDims = 1;
     }
     problem_kq.B.layout = MatrixLayout::Pr;
     problem_kq.C.layout = MatrixLayout::T;
@@ -265,16 +262,9 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
         problem_vs.A_scale.layout = MatrixLayout::N;
 
         problem_vs.aScale2D = true;
-        //problem_vs.aoPtrDims = 1;
 
         problem_vs.aqGroupM = value_group_size();
         problem_vs.aqGroupK = 1;
-        //problem_vs.bqGroupK = 1;
-        //problem_vs.bqGroupK = 1;
-
-        // problem_vs.AO.layout = MatrixLayout::N;
-        // problem_vs.Tao = Type::s32;
-        //problem_vs.aoPtrDims = 0;
     }
 
     problem_vs.B.layout = MatrixLayout::Pr;

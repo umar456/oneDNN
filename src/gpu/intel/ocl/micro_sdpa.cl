@@ -180,8 +180,8 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
 #if WITH_KEY_SCALES
     uint ldkq = div_up(d, KEY_GROUP_SIZE);
 #endif
-#if WITH_VALUE_SCALES
-    uint ldvq = div_up(d, VALUE_GROUP_SIZE);
+#if WITH_VAL_SCALES
+    uint ldvq = div_up(d, VAL_GROUP_SIZE);
 #endif
 
     /* Subgroup IDs for each GEMM */
@@ -221,11 +221,10 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
     msk += MSK_OFF(b1 % MSK_D0, b0 % MSK_D1, 0, 0);
 
 #if WITH_KEY_SCALES
-        // TODO: support b0/b1 broadcast
-    //K_scales += (b1 * KEY_S1 + b0_kv) * (KEY_S2 * KEY_S3 / KEY_GROUP_SIZE);
+    K_scales += KEY_OFF(b1, b0_kv, 0, 0) / KEY_GROUP_SIZE;
 #endif
 #if WITH_VAL_SCALES
-    V_scales += (b1 * VAL_S1 + b0_kv) * (VAL_S2 * VAL_S3 / VAL_GROUP_SIZE);
+    V_scales += VAL_OFF(b1, b0_kv, 0, 0) / VAL_GROUP_SIZE;
 #endif
 
     /* Load Q tile, destined for SLM */
@@ -489,10 +488,6 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
         /* Accumulate A += V * S */
         int k_chunk = min(k - k0, ugemm_kq_wg_tile_m);
 
-#if WITH_VAL_SCALES
-        /* use i0 below to get correct V_scale offset */
-#endif
-
         a_tile_type A_tile1 = ugemm_vs(V, ldv, S_slm, ugemm_kq_wg_tile_m, d,
                                        ugemm_kq_wg_tile_n, k_chunk, 0, 0, 0, sg_i_vs, sg_j_vs,
                                        (local char *)ugemm_slm
@@ -502,6 +497,10 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
                                        );
 
         V += ldv * ugemm_kq_wg_tile_m;
+#if WITH_VAL_SCALES
+        V_scales += ldvq * ugemm_kq_wg_tile_m;
+#endif
+
         tile_binary(A_tile, A_tile1, binary_add);
     }
 
