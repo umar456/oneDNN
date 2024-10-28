@@ -267,13 +267,19 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     problem_vs.A.layout = convert_dnnl_to_kernel_layout(val_md());
 
     if (with_value_scales()) {
-      printf("VALUE scales\n");
         problem_vs.Ta_scale = Type::f16;
         problem_vs.A_scale.alignment = uint8_t(types::data_type_size(data_type::f16));
         problem_vs.A_scale.layout = MatrixLayout::N;
-
         problem_vs.aScale2D = true;
-
+    }
+    if (with_value_zp()) {
+        problem_vs.Tao = problem_vs.Ta_ext;
+        problem_vs.AO.alignment = uint8_t(types::data_type_size(data_type::u8));
+        problem_vs.AO.layout = MatrixLayout::N;
+        problem_vs.aoPtrDims = 2;
+        problem_vs.aOffset = ABOffset::Calc;
+    }
+    if (with_value_scales() || with_value_zp()) {
         problem_vs.aqGroupM = value_group_size();
         problem_vs.aqGroupK = 1;
     }
@@ -298,6 +304,7 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     opts_vs.localB = true;
     opts_vs.slmPtr = true;
     opts_vs.scaleA = with_value_scales();
+    opts_vs.offsetA = with_value_zp();
 
     /* Ask microkernel provider for microkernel */
     try {
@@ -476,7 +483,7 @@ status_t micro_sdpa_t::execute(const exec_ctx_t &ctx) const {
     if (pd()->with_key_scales()) arg_list.set(nargs++, key_scales);
     if (pd()->with_key_zp()) arg_list.set(nargs++, key_zp);
     if (pd()->with_value_scales()) arg_list.set(nargs++, value_scales);
-    // if (wei_zp) ...
+    if (pd()->with_value_zp()) arg_list.set(nargs++, value_zp);
 
     compute::range_t lws = {(size_t)pd()->sg_size(), (size_t)sg_per_wg, 1};
     compute::range_t gws = lws;

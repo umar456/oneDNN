@@ -33,8 +33,8 @@ struct sdpa_desc_t {
     memory_desc_t q_desc; /* queries */
 
     memory_desc_t k_desc; /* keys */
-    runtime_scales_t kv_scales;
-    zero_points_t kv_zero_points;
+    runtime_scales_t kq_scales;
+    zero_points_t kq_zero_points;
 
     memory_desc_t v_desc; /* values */
     runtime_scales_t vs_scales;

@@ -176,7 +176,10 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
            , const global KEY_DATA_T *K_zp
 #endif
 #if WITH_VAL_SCALES
-        , const global half *V_scales
+           , const global half *V_scales
+#endif
+#if WITH_VAL_ZERO_POINTS
+           , const global KEY_DATA_T *V_zp
 #endif
         ) {
     uint sg_ij = sub_group_broadcast(get_local_id(1), 0);
@@ -243,6 +246,9 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
 #endif
 #if WITH_VAL_SCALES
     V_scales += VAL_OFF(b1, b0_kv, 0, 0) / VAL_GROUP_SIZE;
+#endif
+#if WITH_KEY_ZERO_POINTS
+    V_zp += VAL_OFF(b1, b0_kv, 0, 0) / VAL_GROUP_SIZE;
 #endif
 
     /* Load Q tile, destined for SLM */
@@ -516,13 +522,22 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
                                        ugemm_kq_wg_tile_n, k_chunk, 0, 0, 0, sg_i_vs, sg_j_vs,
                                        (local char *)ugemm_slm
 #if WITH_VAL_SCALES
-                                       , V_scales, ldvq
+                     , V_scales
 #endif
-                                       );
+#if WITH_VAL_ZERO_POINTS
+                     , V_zp
+#endif
+#if WITH_VAL_SCALES || WITH_VAL_ZERO_POINTS
+                     , ldvq
+#endif
+                     );
 
         V += ldv * ugemm_kq_wg_tile_m / VAL_ELEMENTS_PER_BYTE;
 #if WITH_VAL_SCALES
         V_scales += ldvq * ugemm_kq_wg_tile_m;
+#endif
+#if WITH_VAL_ZERO_POINTS
+        V_zp += ldvq * ugemm_kq_wg_tile_m;
 #endif
 
         tile_binary(A_tile, A_tile1, binary_add);

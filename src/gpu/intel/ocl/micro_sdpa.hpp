@@ -69,12 +69,13 @@ struct micro_sdpa_t : public gpu_primitive_t {
             VDISPATCH_SDPA(utils::everyone_is(data_type::f16,
                                    qry_md()->data_type, dst_md()->data_type),
                     VERBOSE_UNSUPPORTED_DT);
-            VDISPATCH_SDPA(
-                    utils::one_of(this->key_md()->data_type, data_type::f16,
-                            data_type::u8, data_type::s8, data_type::u4, data_type::s4),
+            VDISPATCH_SDPA(utils::one_of(this->key_md()->data_type,
+                                   data_type::f16, data_type::u8, data_type::s8,
+                                   data_type::u4, data_type::s4),
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_SDPA(utils::one_of(this->val_md()->data_type,
-                                   data_type::f16, data_type::u8, data_type::s8, data_type::u4, data_type::s4),
+                                   data_type::f16, data_type::u8, data_type::s8,
+                                   data_type::u4, data_type::s4),
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_SDPA(set_default_formats() == status::success,
                     VERBOSE_UNSUPPORTED_TAG);
@@ -117,30 +118,30 @@ struct micro_sdpa_t : public gpu_primitive_t {
             return head_size;
         }
 
-        bool with_key_scales() const {
-            return (desc()->kv_scales.ndims_ >= 2);
-        }
+        bool with_key_scales() const { return (desc()->kq_scales.ndims_ >= 2); }
         bool with_value_scales() const {
             return (desc()->vs_scales.ndims_ >= 2);
         }
 
         bool with_key_zp() const {
-            return (!desc()->kv_zero_points.has_default_values(DNNL_ARG_WEIGHTS));
+            return (!desc()->kq_zero_points.has_default_values(
+                    DNNL_ARG_WEIGHTS));
         }
         bool with_value_zp() const {
-          return (!desc()->vs_zero_points.has_default_values(DNNL_ARG_WEIGHTS));
+            return (!desc()->vs_zero_points.has_default_values(
+                    DNNL_ARG_WEIGHTS));
         }
 
         dim_t key_group_size() const {
-            if (with_key_scales()) return desc()->kv_scales.group_dims_[2];
+            if (with_key_scales()) return desc()->kq_scales.group_dims_[2];
             if (with_key_zp())
-                return desc()->kv_zero_points.get_groups(DNNL_ARG_WEIGHTS)[2];
+                return desc()->kq_zero_points.get_groups(DNNL_ARG_WEIGHTS)[2];
             return 0;
         }
         dim_t value_group_size() const {
             if (with_value_scales()) return desc()->vs_scales.group_dims_[3];
             if (with_value_zp())
-                return desc()->vs_zero_points.get_groups(DNNL_ARG_WEIGHTS)[2];
+                return desc()->vs_zero_points.get_groups(DNNL_ARG_WEIGHTS)[3];
             return 0;
         }
 
