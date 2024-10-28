@@ -423,18 +423,18 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
     out.sdpa_attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
 
     out.sdpa_attr_quantized.set_scratchpad_mode(dnnl::scratchpad_mode::library);
-    out.sdpa_kq_attr_quantized.set_scales(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, p.group_size, 1}, memory::data_type::f16);
-    out.sdpa_vs_attr_quantized.set_scales(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, 1, p.group_size}, memory::data_type::f16);
+    //out.sdpa_kq_attr_quantized.set_scales(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, p.group_size, 1}, memory::data_type::f16);
+    //out.sdpa_vs_attr_quantized.set_scales(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, 1, p.group_size}, memory::data_type::f16);
     //out.sdpa_kq_attr_quantized.set_zero_points(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, p.group_size, 1}, memory::data_type::s8);
-    //out.sdpa_vs_attr_quantized.set_zero_points(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, 1, p.group_size}, memory::data_type::s8);
+    out.sdpa_vs_attr_quantized.set_zero_points(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, 1, p.group_size}, memory::data_type::s8);
 
     fill_random(query_data);
     fill_random_quantized(key_quantized_data);
     fill_random_quantized(val_quantized_data);
-    fill_random_scales(key_scale_data);
-    fill_random_scales(val_scale_data);
+    //fill_random_scales(key_scale_data);
+    //fill_random_scales(val_scale_data);
     //fill_random_quantized(key_zp_data);
-    //fill_random_quantized(val_zp_data);
+    fill_random_quantized(val_zp_data);
     fill_mask(mask_data, static_cast<size_t>(p.seq_len));
 
 #if 1
@@ -585,11 +585,11 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
     return out;
 }
 sdpa_dims_t p = {.mb = 1,
-        .seq_len = 1024, // k
-        .head_num = 64,
-        .head_size = 128, // d
-        .query_num = 1024, // q
-        .group_size = 128};
+        .seq_len = 128, // k
+        .head_num = 1,
+        .head_size = 64, // d
+        .query_num = 128, // q
+        .group_size = 32};
 
 TEST(SDPA, compares8tof16) {
 
@@ -641,12 +641,12 @@ TEST(SDPA, compares8tof16) {
                     sdpas8_p.execute(strm,
                             {{DNNL_ARG_QUERIES, t.m_query},
                                     {DNNL_ARG_KEYS, t.m_key_quantized},
-                                    {DNNL_ARG_ATTR_SCALES | DNNL_ARG_KEYS, t.m_key_scales},
+                                    //{DNNL_ARG_ATTR_SCALES | DNNL_ARG_KEYS, t.m_key_scales},
                                     //{DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_KEYS, t.m_key_zp},
 
                                     {DNNL_ARG_VALUES, t.m_value_quantized},
-                                    {DNNL_ARG_ATTR_SCALES | DNNL_ARG_VALUES, t.m_value_scales},
-                                    //{DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_VALUES, t.m_value_zp},
+                                    //{DNNL_ARG_ATTR_SCALES | DNNL_ARG_VALUES, t.m_value_scales},
+                                    {DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_VALUES, t.m_value_zp},
 
                                     {DNNL_ARG_SCALE, t.m_scale},
                                     {DNNL_ARG_ATTN_MASK, t.m_mask},
