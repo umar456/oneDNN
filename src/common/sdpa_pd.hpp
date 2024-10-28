@@ -50,6 +50,10 @@ struct sdpa_pd_t : public primitive_desc_t {
 
     arg_usage_t arg_usage(int arg) const override {
         if (utils::one_of(arg, DNNL_ARG_QUERIES, DNNL_ARG_KEYS, DNNL_ARG_VALUES,
+                    DNNL_ARG_ATTR_SCALES | DNNL_ARG_KEYS,
+                    DNNL_ARG_ATTR_SCALES | DNNL_ARG_VALUES,
+                    DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_KEYS,
+                    DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_VALUES,
                     DNNL_ARG_ATTN_MASK, DNNL_ARG_SCALE))
             return arg_usage_t::input;
 

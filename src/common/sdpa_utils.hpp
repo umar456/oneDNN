@@ -35,11 +35,20 @@ namespace impl {
 static inline sdpa_desc_t create_sdpa_desc(const memory_desc_t *q_md,
         const memory_desc_t *k_md, const memory_desc_t *v_md,
         const memory_desc_t *dst_md, const memory_desc_t *attn_mask_md,
-        data_type_t scale_dt, dim_t kv_head_number, bool invert_scale = false) {
+        data_type_t scale_dt, dim_t kv_head_number, const primitive_attr_t *kv_attr,
+        const primitive_attr_t *vs_attr, bool invert_scale = false) {
     auto sdpa_desc = sdpa_desc_t();
     sdpa_desc.primitive_kind = primitive_kind::sdpa;
     sdpa_desc.q_desc = *q_md;
     sdpa_desc.k_desc = *k_md;
+    if(kv_attr) {
+        sdpa_desc.kv_scales = kv_attr->scales_.get(DNNL_ARG_WEIGHTS);
+        sdpa_desc.kv_zero_points = kv_attr->zero_points_;
+    }
+    if (vs_attr) {
+        sdpa_desc.vs_scales = vs_attr->scales_.get(DNNL_ARG_WEIGHTS);
+        sdpa_desc.vs_zero_points = vs_attr->zero_points_;
+    }
     sdpa_desc.v_desc = *v_md;
     sdpa_desc.dst_desc = *dst_md;
     if (attn_mask_md) sdpa_desc.attn_mask_desc = *attn_mask_md;
@@ -54,9 +63,10 @@ static inline status_t create_sdpa_pd(
         const memory_desc_t *q_md, const memory_desc_t *k_md,
         const memory_desc_t *v_md, const memory_desc_t *dst_md,
         const memory_desc_t *attn_mask_md, data_type_t scale_dt,
-        bool invert_scale, const primitive_attr_t *attr, dim_t kv_head_number) {
+        bool invert_scale, const primitive_attr_t *attr, dim_t kv_head_number,
+        const primitive_attr_t *k_attr, const primitive_attr_t *v_attr) {
     auto sdpa_desc = create_sdpa_desc(q_md, k_md, v_md, dst_md, attn_mask_md,
-            scale_dt, kv_head_number, invert_scale);
+            scale_dt, kv_head_number, k_attr, v_attr, invert_scale);
 
     int ndims = dst_md->ndims;
     int r = ndims - 2, c = ndims - 1;
@@ -70,15 +80,20 @@ static inline status_t create_sdpa_pd(
     if (attr == nullptr) attr = &default_attr();
 
     primitive_attr_t sdpa_attr = *attr;
-    auto zero_points = attr->zero_points_;
-    VCHECK_SDPA(IMPLICATION(!types::is_integral_dt(k_md->data_type),
-                        zero_points.has_default_values(DNNL_ARG_KEYS)),
-            VERBOSE_UNSUPPORTED_ZP_CFG);
+    //primitive_attr_t sdpa_k_attr = (k_attr) ? *k_attr : default_attr();
+    //primitive_attr_t sdpa_v_attr = (v_attr) ? *v_attr : default_attr();
 
-    VCHECK_SDPA(IMPLICATION(!types::is_integral_dt(v_md->data_type),
-                           zero_points.has_default_values(DNNL_ARG_VALUES)),
-            VERBOSE_UNSUPPORTED_ZP_CFG);
+    //auto k_zero_points = k_attr->zero_points_;
+    //VCHECK_SDPA(IMPLICATION(!types::is_integral_dt(k_md->data_type),
+    //                    k_zero_points.has_default_values(DNNL_ARG_WEIGHTS)),
+    //        VERBOSE_UNSUPPORTED_ZP_CFG);
+    //// TODO(umar): additional checks for scales
 
+    //auto v_zero_points = v_attr->zero_points_;
+    //VCHECK_SDPA(IMPLICATION(!types::is_integral_dt(v_md->data_type),
+    //                    v_zero_points.has_default_values(DNNL_ARG_WEIGHTS)),
+    //        VERBOSE_UNSUPPORTED_ZP_CFG);
+    //// TODO(umar): additional checks for scales
 
     primitive_desc_iterator_t it(
             engine, (op_desc_t *)&sdpa_desc, &sdpa_attr, nullptr);

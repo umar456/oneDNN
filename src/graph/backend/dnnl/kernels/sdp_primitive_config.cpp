@@ -222,7 +222,7 @@ status_t sdp_primitive_config_t::init(std::shared_ptr<subgraph_t> &sg,
 
     CHECK(create_sdpa_pd(sdpa_pd_, p_engine.get(), md_q.get(), md_k.get(),
             md_v.get(), md_dst.get(), md_mask.get(), scale_dt, invert_scale_,
-            attr.get(), kv_head_number_));
+                         attr.get(), kv_head_number_, k_attr.get(), v_attr.get()));
 
     auto status = sdpa_pd_->create_primitive(sdpa_prim_, p_engine.get());
 

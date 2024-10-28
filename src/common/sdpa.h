@@ -37,6 +37,8 @@
 /// @param dst_desc Destination memory descriptor.
 /// @param attn_mask_desc Attention mask memory descriptor.
 /// @param attr Primitive attributes (can be NULL).
+/// @param k_attr Attribute for the Key tensor(can be NULL).
+/// @param v_attr Attribute for the Value tensor(can be NULL).
 /// @returns #dnnl_success on success and a status describing the error
 ///     otherwise.
 
@@ -46,7 +48,8 @@ dnnl_status_t DNNL_API dnnl_sdpa_primitive_desc_create(
         const_dnnl_memory_desc_t value_desc, const_dnnl_memory_desc_t dst_desc,
         const_dnnl_memory_desc_t mask_desc, dnnl_data_type_t scale_dt,
         bool invert_scale, dnnl_dim_t kv_head_number,
-        const_dnnl_primitive_attr_t attr);
+        const_dnnl_primitive_attr_t attr, const_dnnl_primitive_attr_t k_attr,
+        const_dnnl_primitive_attr_t v_attr);
 
 /// @} dnnl_api_sdpa
 

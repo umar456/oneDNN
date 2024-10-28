@@ -209,10 +209,19 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     problem_kq.A.layout = convert_dnnl_to_kernel_layout(key_md());
     if (with_key_scales()) {
         problem_kq.Ta_scale = Type::f16;
-        problem_kq.A_scale.alignment = int(types::data_type_size(data_type::f16));
+        problem_kq.A_scale.alignment
+                = uint8_t(types::data_type_size(data_type::f16));
         problem_kq.A_scale.layout = MatrixLayout::T;
-
         problem_kq.aScale2D = true;
+    }
+    if (with_key_zp()) {
+        problem_kq.Tao = problem_kq.Ta_ext;
+        problem_kq.AO.alignment = uint8_t(types::data_type_size(data_type::s8));
+        problem_kq.AO.layout = MatrixLayout::T;
+        problem_kq.aoPtrDims = 2;
+        problem_kq.aOffset = ABOffset::Calc;
+    }
+    if (with_key_scales() || with_key_zp()) {
         problem_kq.aqGroupM = 1;
         problem_kq.aqGroupK = key_group_size();
     }
@@ -243,6 +252,7 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     opts_kq.localB = true;
     opts_kq.slmPtr = true;
     opts_kq.scaleA = with_key_scales();
+    opts_kq.offsetA = with_key_zp();
 
     /* Ask microkernel provider for microkernel */
     try {
@@ -257,8 +267,9 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     problem_vs.A.layout = convert_dnnl_to_kernel_layout(val_md());
 
     if (with_value_scales()) {
+      printf("VALUE scales\n");
         problem_vs.Ta_scale = Type::f16;
-        problem_vs.A_scale.alignment = int(types::data_type_size(data_type::f16));
+        problem_vs.A_scale.alignment = uint8_t(types::data_type_size(data_type::f16));
         problem_vs.A_scale.layout = MatrixLayout::N;
 
         problem_vs.aScale2D = true;
@@ -351,9 +362,12 @@ status_t micro_sdpa_t::init(impl::engine_t *engine) {
     kernel_ctx.define_int("WITH_KEY_SCALES", pd()->with_key_scales());
     kernel_ctx.define_int("WITH_VAL_SCALES", pd()->with_value_scales());
 
-    if (pd()->with_key_scales())
+    kernel_ctx.define_int("WITH_KEY_ZERO_POINTS", pd()->with_key_zp());
+    kernel_ctx.define_int("WITH_VAL_ZERO_POINTS", pd()->with_value_zp());
+
+    if (pd()->with_key_scales() || pd()->with_key_zp())
         kernel_ctx.define_int("KEY_GROUP_SIZE", pd()->key_group_size());
-    if (pd()->with_value_scales())
+    if (pd()->with_value_scales() || pd()->with_value_zp())
         kernel_ctx.define_int("VAL_GROUP_SIZE", pd()->value_group_size());
 
     def_data_type(kernel_ctx, d->scale_dt, "SCALE");
@@ -460,7 +474,7 @@ status_t micro_sdpa_t::execute(const exec_ctx_t &ctx) const {
     int nargs = 9;
 
     if (pd()->with_key_scales()) arg_list.set(nargs++, key_scales);
-    // if (key_zp) arg_list.set(nargs++, key_zp);
+    if (pd()->with_key_zp()) arg_list.set(nargs++, key_zp);
     if (pd()->with_value_scales()) arg_list.set(nargs++, value_scales);
     // if (wei_zp) ...
 

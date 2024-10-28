@@ -20,6 +20,7 @@
 #include <assert.h>
 #include "common/c_types_map.hpp"
 #include "common/memory_desc.hpp"
+#include "common/primitive_attr_quant.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -30,8 +31,15 @@ struct sdpa_desc_t {
     // descriptor. Must be sdpa.
     dnnl_primitive_kind_t primitive_kind;
     memory_desc_t q_desc; /* queries */
+
     memory_desc_t k_desc; /* keys */
+    runtime_scales_t kv_scales;
+    zero_points_t kv_zero_points;
+
     memory_desc_t v_desc; /* values */
+    runtime_scales_t vs_scales;
+    zero_points_t vs_zero_points;
+
     memory_desc_t dst_desc;
     memory_desc_t attn_mask_desc;
     data_type_t scale_dt;

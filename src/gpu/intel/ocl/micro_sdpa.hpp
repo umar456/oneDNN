@@ -118,20 +118,29 @@ struct micro_sdpa_t : public gpu_primitive_t {
         }
 
         bool with_key_scales() const {
-            return (attr()->scales_.get(DNNL_ARG_KEYS).ndims_ >= 2);
+            return (desc()->kv_scales.ndims_ >= 2);
         }
         bool with_value_scales() const {
-            return (attr()->scales_.get(DNNL_ARG_VALUES).ndims_ >= 2);
+            return (desc()->vs_scales.ndims_ >= 2);
+        }
+
+        bool with_key_zp() const {
+            return (!desc()->kv_zero_points.has_default_values(DNNL_ARG_WEIGHTS));
+        }
+        bool with_value_zp() const {
+          return (!desc()->vs_zero_points.has_default_values(DNNL_ARG_WEIGHTS));
         }
 
         dim_t key_group_size() const {
-            if (with_key_scales())
-                return attr()->scales_.get(DNNL_ARG_KEYS).group_dims_[2];
+            if (with_key_scales()) return desc()->kv_scales.group_dims_[2];
+            if (with_key_zp())
+                return desc()->kv_zero_points.get_groups(DNNL_ARG_WEIGHTS)[2];
             return 0;
         }
         dim_t value_group_size() const {
-            if (with_value_scales())
-                return attr()->scales_.get(DNNL_ARG_VALUES).group_dims_[3];
+            if (with_value_scales()) return desc()->vs_scales.group_dims_[3];
+            if (with_value_zp())
+                return desc()->vs_zero_points.get_groups(DNNL_ARG_WEIGHTS)[2];
             return 0;
         }
 

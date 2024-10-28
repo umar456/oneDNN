@@ -42,9 +42,12 @@ struct sdpa : public dnnl::primitive {
         primitive_desc(const engine &aengine, const memory::desc &query_desc,
                 const memory::desc &key_desc, const memory::desc &value_desc,
                 const memory::desc &output_desc,
-                const primitive_attr &attr = default_attr())
+                const primitive_attr &attr = default_attr(),
+                const primitive_attr &k_attr = default_attr(),
+                const primitive_attr &v_attr = default_attr())
             : primitive_desc(aengine, query_desc, key_desc, value_desc, nullptr,
-                    memory::data_type::undef, output_desc, false, 1, attr) {}
+                    memory::data_type::undef, output_desc, false, 1, attr,
+                    k_attr, v_attr) {}
 
         /// Constructs a primitive descriptor for a sdpa primitive
         ///
@@ -64,10 +67,12 @@ struct sdpa : public dnnl::primitive {
                 const memory::desc &key_desc, const memory::desc &value_desc,
                 const memory::desc &attn_mask_desc,
                 const memory::desc &output_desc,
-                const primitive_attr &attr = default_attr())
+                const primitive_attr &attr = default_attr(),
+                const primitive_attr &k_attr = default_attr(),
+                const primitive_attr &v_attr = default_attr())
             : primitive_desc(aengine, query_desc, key_desc, value_desc,
                     &attn_mask_desc, memory::data_type::undef, output_desc,
-                    false, 1, attr) {}
+                    false, 1, attr, k_attr, v_attr) {}
 
         /// Constructs a primitive descriptor for a sdpa primitive from a C
         /// API primitive descriptor that must have a matching kind.
@@ -102,15 +107,17 @@ struct sdpa : public dnnl::primitive {
                 const memory::desc &key_desc, const memory::desc &value_desc,
                 const memory::desc *attn_mask_desc, memory::data_type scale_dt,
                 const memory::desc &output_desc, bool invert_scale,
-                dnnl_dim_t kv_head_number, const primitive_attr &attr) {
+                dnnl_dim_t kv_head_number, const primitive_attr &attr,
+                const primitive_attr &k_attr = default_attr(),
+                const primitive_attr &v_attr = default_attr()) {
 
             dnnl_primitive_desc_t pd = nullptr;
-            dnnl_status_t status
-                    = dnnl_sdpa_primitive_desc_create(&pd, aengine.get(),
-                            query_desc.get(), key_desc.get(), value_desc.get(),
-                            output_desc.get(), optional_arg(attn_mask_desc),
-                            (dnnl::impl::data_type_t)scale_dt, invert_scale,
-                            kv_head_number, attr.get());
+            dnnl_status_t status = dnnl_sdpa_primitive_desc_create(&pd,
+                    aengine.get(), query_desc.get(), key_desc.get(),
+                    value_desc.get(), output_desc.get(),
+                    optional_arg(attn_mask_desc),
+                    (dnnl::impl::data_type_t)scale_dt, invert_scale,
+                    kv_head_number, attr.get(), k_attr.get(), v_attr.get());
 
             dnnl::error::wrap_c_api(status,
                     "could not create a primitive descriptor for a sdpa "

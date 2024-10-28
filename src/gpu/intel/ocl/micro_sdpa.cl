@@ -167,10 +167,13 @@ DECLARE_2D_TILE_RSELECT(a_scale_tile_type, SUBGROUP_SIZE, ugemm_vs_sg_tile_n, 1,
 
 __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) kernel void
 micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DATA_T *V,
-        global half *A, global SCALE_DATA_T *scale_ptr, const global half *msk,
-        int d, int k, int q
+           global half *A, global SCALE_DATA_T *scale_ptr, const global half *msk,
+           int d, int k, int q
 #if WITH_KEY_SCALES
-        , const global half *K_scales
+           , const global half *K_scales
+#endif
+#if WITH_KEY_ZERO_POINTS
+           , const global KEY_DATA_T *K_zp
 #endif
 #if WITH_VAL_SCALES
         , const global half *V_scales
@@ -189,10 +192,10 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
     uint ldv = VAL_S2;
     uint lda = DST_S2;
 
-#if WITH_KEY_SCALES
+#if WITH_KEY_SCALES || WITH_KEY_ZERO_POINTS
     uint ldkq = div_up(d, KEY_GROUP_SIZE);
 #endif
-#if WITH_VAL_SCALES
+#if WITH_VAL_SCALES || WITH_VAL_ZERO_POINTS
     uint ldvq = div_up(d, VAL_GROUP_SIZE);
 #endif
 
@@ -234,6 +237,9 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
 
 #if WITH_KEY_SCALES
     K_scales += KEY_OFF(b1, b0_kv, 0, 0) / KEY_GROUP_SIZE;
+#endif
+#if WITH_KEY_ZERO_POINTS
+    K_zp += KEY_OFF(b1, b0_kv, 0, 0) / KEY_GROUP_SIZE;
 #endif
 #if WITH_VAL_SCALES
     V_scales += VAL_OFF(b1, b0_kv, 0, 0) / VAL_GROUP_SIZE;
@@ -336,11 +342,17 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
           = ugemm_kq(K, ldk, Q_slm, D_MAX, k, ugemm_kq_wg_tile_n, d, k0,
                      0, 0, sg_i_kq, sg_j_kq, (local char *)ugemm_slm
 #if WITH_KEY_SCALES
-                     , K_scales, ldkq
+                     , K_scales
+#endif
+#if WITH_KEY_ZERO_POINTS
+                     , K_zp
+#endif
+#if WITH_KEY_SCALES || WITH_KEY_ZERO_POINTS
+                     , ldkq
 #endif
                      );
 
-#if 0
+#if 1
         if (k0 == 0 && sg_i_kq == 0 && sg_j_kq == 0 && get_sub_group_local_id() == 0) {
             printf("ldk = %d\n", (int) ldk);
             for (int i = 0; i < 4; i++) {

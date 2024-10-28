@@ -332,7 +332,8 @@ struct sdpa_tensors {
 
     memory m_reorder_scale_attr, m_key_scales, m_key_zp, m_value_scales,
             m_value_zp;
-    dnnl::primitive_attr reorder_attr, sdpa_attr, sdpa_attr_quantized;
+    dnnl::primitive_attr reorder_attr, sdpa_attr, sdpa_attr_quantized,
+            sdpa_kv_attr_quantized, sdpa_vs_attr_quantized;
 };
 
 vector<float> dequantize(const vector<float> &input, const vector<int> &zero_points,
@@ -425,17 +426,17 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
     out.sdpa_attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
 
     out.sdpa_attr_quantized.set_scratchpad_mode(dnnl::scratchpad_mode::library);
-    //out.sdpa_attr_quantized.set_scales(DNNL_ARG_KEYS, 1 << 3, {1, 1, p.group_size, 1}, memory::data_type::f16);
-    out.sdpa_attr_quantized.set_scales(DNNL_ARG_VALUES, 1 << 3, {1, 1, 1, p.group_size}, memory::data_type::f16);
-    //out.sdpa_attr_quantized.set_zero_points(DNNL_ARG_KEYS, 1 << 3, {1, 1, 1, group_size}, memory::data_type::s8);
-    //out.sdpa_attr_quantized.set_zero_points(DNNL_ARG_VALUES, 1 << 3, {1, 1, 1, group_size}, memory::data_type::s8);
+    //out.sdpa_kv_attr_quantized.set_scales(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, p.group_size, 1}, memory::data_type::f16);
+    //out.sdpa_vs_attr_quantized.set_scales(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, 1, p.group_size}, memory::data_type::f16);
+    out.sdpa_kv_attr_quantized.set_zero_points(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, p.group_size, 1}, memory::data_type::s8);
+    //out.sdpa_vs_attr_quantized.set_zero_points(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, 1, group_size}, memory::data_type::s8);
 
     fill_random(query_data);
     fill_random_quantized(key_quantized_data);
     fill_random_quantized(val_quantized_data);
     //fill_random_scales(key_scale_data);
-    fill_random_scales(val_scale_data);
-    //fill_random_quantized(key_zp_data);
+    //fill_random_scales(val_scale_data);
+    fill_random_quantized(key_zp_data);
     //fill_random_quantized(val_zp_data);
     fill_mask(mask_data, static_cast<size_t>(p.seq_len));
 
@@ -445,22 +446,29 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
     auto &V = val_quantized_data;
     auto &Ks = key_scale_data;
     auto &Vs = val_scale_data;
+    auto &Kz = key_zp_data;
+    auto &Vz = val_zp_data;
     auto d = p.head_size;
     auto k = p.seq_len;
     auto q = p.query_num;
 
     int kr = -1, kc = -1, qr = -1, qc = -1, vr = -1, vc = -1, xb = 0;
-    int ksr = -1, ksc = -1, vsr = -1, vsc = -1;
+    int ksr = -1, ksc = -1, kzr = -1, kzc = -1,
+        vsr = -1, vsc = -1, vzr = -1, vzc = -1;
     if (getenv("KR")) kr = atoi(getenv("KR"));
     if (getenv("KC")) kc = atoi(getenv("KC"));
     if (getenv("KSR")) ksr = atoi(getenv("KSR"));
     if (getenv("KSC")) ksc = atoi(getenv("KSC"));
+    if (getenv("KZR")) kzr = atoi(getenv("KZR"));
+    if (getenv("KZC")) kzc = atoi(getenv("KZC"));
     if (getenv("QR")) qr = atoi(getenv("QR"));
     if (getenv("QC")) qc = atoi(getenv("QC"));
     if (getenv("VR")) vr = atoi(getenv("VR"));
     if (getenv("VC")) vc = atoi(getenv("VC"));
     if (getenv("VSR")) vsr = atoi(getenv("VSR"));
     if (getenv("VSC")) vsc = atoi(getenv("VSC"));
+    if (getenv("VZR")) vzr = atoi(getenv("VZR"));
+    if (getenv("VZC")) vzc = atoi(getenv("VZC"));
     if (getenv("XB")) xb = atoi(getenv("XB"));
 
     if (kr >= 0 || kc >= 0) {
@@ -481,6 +489,13 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
         ksc = std::max(ksc, 0);
         for (auto &ks: Ks) ks = 0;
         Ks[(xb*d*k + ksr*d)/p.group_size + ksc] = 1;
+    }
+    if (kzr >= 0 || kzc >= 0) {
+        kzr = std::max(kzr, 0);
+        kzc = std::max(kzc, 0);
+        for (auto &kz: Kz) kz = 0;
+        printf("kz: %ld\n", (xb * d * k + kzr * d) / p.group_size + kzc);
+        Kz[(xb * d * k + kzr * d) / p.group_size + kzc] = 2;
     }
     if (qr >= 0 || qc >= 0) {
         qr = std::max(qr, 0);
@@ -514,9 +529,32 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
         for (auto &vs: Vs) vs = 0;
         Vs[(xb*d*k + vsc*d)/p.group_size + vsr] = 1;
     }
+    if (vzr >= 0 || vzc >= 0) {
+        vzr = std::max(vzr, 0);
+        vzc = std::max(vzc, 0);
+        for (auto &vz: Vz) vz = 0;
+        Vz[(xb*d*k + vzc*d)/p.group_size + vzr] = 1;
+    }
 #endif
 
+    printf("quantized: ");
+    for (int i = 0; i < 10; i++) {
+        printf("%8.2f", key_quantized_data[i]);
+    }
+    printf("\nscales: ");
+    for (int i = 0; i < 10; i++) {
+        printf("%8.2f", key_scale_data[i]);
+    }
+    printf("\nzp: ");
+    for (int i = 0; i < 10; i++) {
+        printf("%4d", key_zp_data[i]);
+    }
     auto key_data = dequantize(key_quantized_data, key_zp_data, key_scale_data, p.group_size);
+    printf("\ndequantized: ");
+    for (int i = 0; i < 10; i++) {
+        printf("%8.2f", key_data[i]);
+    }
+    printf("\n");
     auto value_data = dequantize(val_quantized_data, val_zp_data, val_scale_data, p.group_size);
 
     write_to_dnnl_memory(mask_data.data(), out.m_mask);
@@ -534,6 +572,9 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
     write_to_dnnl_memory(val_zp_data.data(), out.m_value_zp);
     write_to_dnnl_memory(key_scale_data.data(), out.m_key_scales);
     write_to_dnnl_memory(val_scale_data.data(), out.m_value_scales);
+    print_mem(out.m_key_zp, "key_zp_data");
+    print_mem(out.m_key, "key");
+    //print_mem(out.m_query, "query");
 
     //print_mem(out.m_query, "query");
     //print_mem(out.m_key, "key");
@@ -562,186 +603,13 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
     return out;
 }
 sdpa_dims_t p = {.mb = 1,
-        .seq_len = 128,
-        .head_num = 16,
-        .head_size = 64,
-        .query_num = 128,
+                 .seq_len = 128, // k
+        .head_num = 1,
+        .head_size = 64, // d
+        .query_num = 128, // q
         .group_size = 32};
 
-//TEST(SDPA, primitive) {
-//    //sdpa_dims_t p = {32, 384, 16, 64, 384};
-//    memory::data_type dt = memory::data_type::f16;
-//    memory::data_type kdt = memory::data_type::f16;
-//    memory::data_type vdt = memory::data_type::f16;
-//    memory::data_type scale_dt = memory::data_type::f16;
-//    bool invert_scale = false;
-//
-//    // Create execution dnnl::engine.
-//    dnnl::engine eng(engine::kind::gpu, 0);
-//    // Create dnnl::stream.
-//    dnnl::stream strm(eng);
-//
-//    sdpa_tensors t = get_descriptors(eng, p, dt, kdt, vdt);
-//
-//    dnnl::primitive_attr bmm1_attr;
-//    bmm1_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
-//    dnnl::post_ops bmm1_po;
-//    bmm1_po.append_binary(algorithm::binary_div, t.m_scale.get_desc());
-//    bmm1_po.append_binary(algorithm::binary_add, t.m_mask.get_desc());
-//    bmm1_attr.set_post_ops(bmm1_po);
-//
-//    const memory::dims score_sz = {p.mb, p.head_num, p.query_num, p.seq_len};
-//    auto score_md = memory::desc(score_sz, dt, memory::format_tag::abcd);
-//    auto m_score = memory(score_md, eng);
-//
-//    auto bmm1_pd = matmul::primitive_desc(
-//            eng, t.m_query.get_desc(), t.m_key.get_desc(), score_md, bmm1_attr);
-//    auto bmm1_prim = matmul(bmm1_pd);
-//
-//    // attention_probs = softmax(masked_score)
-//    primitive_attr softmax_attr;
-//    softmax_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
-//    auto softmax_pd = softmax_forward::primitive_desc(eng,
-//            dnnl::prop_kind::forward_inference, algorithm::softmax_accurate,
-//            score_md, score_md, /* axis = */ score_md.get_ndims() - 1,
-//            softmax_attr);
-//    auto softmax_prim = softmax_forward(softmax_pd);
-//
-//    // attention_output = attention_probs x value
-//    primitive_attr bmm2_attr;
-//    bmm2_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
-//    auto bmm2_pd = matmul::primitive_desc(eng, score_md, t.m_value.get_desc(),
-//            t.m_output.get_desc(), bmm2_attr);
-//    auto bmm2_prim = matmul(bmm2_pd);
-//
-//    size_t max_scratchpad_size = 0;
-//    auto bmm1_scratchpad = bmm1_pd.scratchpad_desc().get_size();
-//    auto softmax_scratchpad = softmax_pd.scratchpad_desc().get_size();
-//    auto bmm2_scratchpad = bmm2_pd.scratchpad_desc().get_size();
-//    for (auto &sz : {bmm1_scratchpad, softmax_scratchpad, bmm2_scratchpad}) {
-//        if (max_scratchpad_size < sz) max_scratchpad_size = sz;
-//    }
-//    auto scratchpad_md
-//            = memory::desc({static_cast<memory::dim>(max_scratchpad_size)},
-//                    memory::data_type::u8, memory::format_tag::a);
-//
-//    // allocate intermediate memory
-//    auto m_scratchpad = memory(scratchpad_md, eng);
-//
-//    const auto loop = [&]() {
-//        // each primitive will use all threads
-//        bmm1_prim.execute(strm,
-//                {{DNNL_ARG_SRC, t.m_query}, {DNNL_ARG_WEIGHTS, t.m_key},
-//                        {DNNL_ARG_DST, m_score},
-//                        {DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1,
-//                                t.m_scale},
-//                        {DNNL_ARG_ATTR_MULTIPLE_POST_OP(1) | DNNL_ARG_SRC_1, t.m_mask},
-//                        {DNNL_ARG_SCRATCHPAD, m_scratchpad}});
-//
-//        softmax_prim.execute(strm,
-//                {{DNNL_ARG_SRC, m_score}, {DNNL_ARG_DST, m_score},
-//                        {DNNL_ARG_SCRATCHPAD, m_scratchpad}});
-//
-//        bmm2_prim.execute(strm,
-//                {{DNNL_ARG_SRC, m_score}, {DNNL_ARG_WEIGHTS, t.m_value},
-//                        {DNNL_ARG_DST, t.m_output},
-//                        {DNNL_ARG_SCRATCHPAD, m_scratchpad}});
-//    };
-//
-//    // Warmup run.
-//    // Execute primitives of sdpa.
-//    loop();
-//
-//    // Wait for the computation to finish.
-//    strm.wait();
-//
-//    //print_mem(t.m_output, "output");
-//}
-//
-//TEST(SDPA, f16) {
-//    //sdpa_dims_t p = {32, 384, 16, 64, 384};
-//    memory::data_type dt = memory::data_type::f16;
-//    memory::data_type kdt = memory::data_type::f16;
-//    memory::data_type vdt = memory::data_type::f16;
-//    memory::data_type scale_dt = memory::data_type::f16;
-//    bool invert_scale = false;
-//
-//    // Create execution dnnl::engine.
-//    dnnl::engine eng(engine::kind::gpu, 0);
-//    // Create dnnl::stream.
-//    dnnl::stream strm(eng);
-//
-//    sdpa_tensors t = get_descriptors(eng, p, dt, kdt, vdt);
-//
-//    dnnl::primitive_attr attr;
-//    attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
-//
-//    using namespace dnnl::experimental;
-//    auto mask = t.m_mask.get_desc();
-//    auto sdpa_pd = sdpa::primitive_desc(eng, t.m_query.get_desc(),
-//            t.m_key.get_desc(), t.m_value.get_desc(), &mask, scale_dt,
-//            t.m_output.get_desc(), invert_scale, 1, attr);
-//    auto sdpa_p = sdpa(sdpa_pd);
-//
-//    sdpa_p.execute(strm,
-//            {{DNNL_ARG_QUERIES, t.m_query}, {DNNL_ARG_KEYS, t.m_key},
-//                    {DNNL_ARG_VALUES, t.m_value}, {DNNL_ARG_SCALE, t.m_scale},
-//                    {DNNL_ARG_ATTN_MASK, t.m_mask},
-//                    {DNNL_ARG_DST, t.m_output}});
-//    strm.wait();
-//
-//    //print_mem(t.m_output, "output");
-//}
-//
-//TEST(SDPA, s4) {
-//    //sdpa_dims_t p = {32, 384, 16, 64, 384};
-//
-//    // Create execution dnnl::engine.
-//    dnnl::engine eng(engine::kind::gpu, 0);
-//    // Create dnnl::stream.
-//    dnnl::stream strm(eng);
-//
-//    memory::data_type dt = memory::data_type::f16;
-//    memory::data_type kdt = memory::data_type::s8;
-//    memory::data_type vdt = memory::data_type::f16;
-//    memory::data_type scale_dt = memory::data_type::f16;
-//    bool invert_scale = false;
-//
-//    sdpa_tensors t = get_descriptors(eng, p, dt, kdt, vdt);
-//
-//    using namespace dnnl::experimental;
-//    auto mask = t.m_mask.get_desc();
-//    auto sdpa_pd = sdpa::primitive_desc(eng, t.m_query.get_desc(),
-//            t.m_key.get_desc(), t.m_value.get_desc(), &mask, scale_dt,
-//            t.m_output.get_desc(), invert_scale, 1, t.sdpa_attr);
-//    auto sdpa_p = sdpa(sdpa_pd);
-//
-//
-//    print_mem(t.m_key_scales, "key_scale_attr");
-//    //print_mem(t.m_key_zp, "key_zero_points");
-//    //print_mem(t.m_value_scales, "value_scale_attr");
-//    //print_mem(t.m_value_zp, "value_zero_points");
-//
-//
-//    sdpa_p.execute(strm,
-//            {{DNNL_ARG_QUERIES, t.m_query},
-//             {DNNL_ARG_KEYS, t.m_key},
-//             {DNNL_ARG_ATTR_SCALES | DNNL_ARG_KEYS, t.m_key_scales},
-//             //{DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_KEYS, t.m_key_zp},
-//
-//             {DNNL_ARG_VALUES, t.m_value},
-//             //{DNNL_ARG_ATTR_SCALES | DNNL_ARG_VALUES, t.m_value_scales},
-//             //{DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_VALUES, t.m_value_zp},
-//
-//             {DNNL_ARG_SCALE, t.m_scale}, {DNNL_ARG_ATTN_MASK, t.m_mask},
-//             {DNNL_ARG_DST, t.m_output}});
-//    strm.wait();
-//    //print_mem(t.m_output, "output");
-//}
-
-
 TEST(SDPA, compares8tof16) {
-    //sdpa_dims_t p = {32, 384, 16, 64, 384};
 
 #if 1
     if (getenv("B")) p.mb = atoi(getenv("B"));
@@ -758,7 +626,7 @@ TEST(SDPA, compares8tof16) {
 
     memory::data_type dt = memory::data_type::f16;
     memory::data_type kdt = memory::data_type::s8;
-    memory::data_type vdt = memory::data_type::s4;
+    memory::data_type vdt = memory::data_type::f16;
     memory::data_type scale_dt = memory::data_type::f16;
     bool invert_scale = false;
 
@@ -767,8 +635,9 @@ TEST(SDPA, compares8tof16) {
     using namespace dnnl::experimental;
     auto mask = t.m_mask.get_desc();
     auto sdpas8_pd = sdpa::primitive_desc(eng, t.m_query.get_desc(),
-            t.m_key_quantized.get_desc(), t.m_value_quantized.get_desc(), &mask, scale_dt,
-            t.m_output_quantized.get_desc(), invert_scale, 1, t.sdpa_attr_quantized);
+            t.m_key_quantized.get_desc(), t.m_value_quantized.get_desc(), &mask,
+            scale_dt, t.m_output_quantized.get_desc(), invert_scale, 1,
+            t.sdpa_attr_quantized, t.sdpa_kv_attr_quantized, t.sdpa_vs_attr_quantized);
     auto sdpas8_p = sdpa(sdpas8_pd);
 
     auto sdpaf16_pd = sdpa::primitive_desc(eng, t.m_query.get_desc(),
@@ -785,18 +654,19 @@ TEST(SDPA, compares8tof16) {
 #if 1
     if (!::getenv("SKIP_S8"))
 #endif
-    sdpas8_p.execute(strm,
-            {{DNNL_ARG_QUERIES, t.m_query}, {DNNL_ARG_KEYS, t.m_key_quantized},
-                    //{DNNL_ARG_ATTR_SCALES | DNNL_ARG_KEYS, t.m_key_scales},
-                    //{DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_KEYS, t.m_key_zp},
+        sdpas8_p.execute(strm,
+                {{DNNL_ARG_QUERIES, t.m_query},
+                        {DNNL_ARG_KEYS, t.m_key_quantized},
+                        //{DNNL_ARG_ATTR_SCALES | DNNL_ARG_KEYS, t.m_key_scales},
+                        {DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_KEYS, t.m_key_zp},
 
-                    {DNNL_ARG_VALUES, t.m_value_quantized},
-                    {DNNL_ARG_ATTR_SCALES | DNNL_ARG_VALUES, t.m_value_scales},
-                    //{DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_VALUES, t.m_value_zp},
+                        {DNNL_ARG_VALUES, t.m_value_quantized},
+                        //{DNNL_ARG_ATTR_SCALES | DNNL_ARG_VALUES, t.m_value_scales},
+                        //{DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_VALUES, t.m_value_zp},
 
-                    {DNNL_ARG_SCALE, t.m_scale},
-                    {DNNL_ARG_ATTN_MASK, t.m_mask},
-                    {DNNL_ARG_DST, t.m_output_quantized}});
+                        {DNNL_ARG_SCALE, t.m_scale},
+                        {DNNL_ARG_ATTN_MASK, t.m_mask},
+                        {DNNL_ARG_DST, t.m_output_quantized}});
 #if 1
     if (!::getenv("SKIP_F16"))
 #endif
@@ -838,4 +708,5 @@ TEST(SDPA, compares8tof16) {
 
     t.m_output.unmap_data(mapped_ptr_f16);
     t.m_output_quantized.unmap_data(mapped_ptr_s8);
+    ASSERT_EQ(mismatches, 0);
 }
