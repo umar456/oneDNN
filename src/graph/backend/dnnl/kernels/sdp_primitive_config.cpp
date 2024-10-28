@@ -215,6 +215,8 @@ status_t sdp_primitive_config_t::init(std::shared_ptr<subgraph_t> &sg,
     if (scale_) scale_dt = scale_->get_logical_tensor().data_type;
 
     dnnl::primitive_attr attr;
+    dnnl::primitive_attr k_attr;
+    dnnl::primitive_attr v_attr;
 
     auto &mgr = sg->fusion_info_mgr_;
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
