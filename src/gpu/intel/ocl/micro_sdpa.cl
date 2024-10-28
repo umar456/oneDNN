@@ -247,7 +247,7 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
 #if WITH_VAL_SCALES
     V_scales += VAL_OFF(b1, b0_kv, 0, 0) / VAL_GROUP_SIZE;
 #endif
-#if WITH_KEY_ZERO_POINTS
+#if WITH_VAL_ZERO_POINTS
     V_zp += VAL_OFF(b1, b0_kv, 0, 0) / VAL_GROUP_SIZE;
 #endif
 
@@ -358,7 +358,7 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
 #endif
                      );
 
-#if 1
+#if 0
         if (k0 == 0 && sg_i_kq == 0 && sg_j_kq == 0 && get_sub_group_local_id() == 0) {
             printf("ldk = %d\n", (int) ldk);
             for (int i = 0; i < 4; i++) {
@@ -531,6 +531,19 @@ micro_sdpa(const global KEY_DATA_T *K, const global half *Q, const global VAL_DA
                      , ldvq
 #endif
                      );
+
+#if 0
+        if (k0 == 0 && sg_i_kq == 0 && sg_j_kq == 0 && get_sub_group_local_id() == 0) {
+            printf("ldv = %d\n", (int) ldv);
+            for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 4; j++)
+                    printf("\t%f", xlane_tile_access(A_tile1, j, i, SUBGROUP_SIZE, ugemm_vs_c_type_block0,
+                                                     ugemm_vs_c_type_block1, ugemm_vs_c_type_nblock0));
+                printf("\n");
+            }
+        }
+#endif
+
 
         V += ldv * ugemm_kq_wg_tile_m / VAL_ELEMENTS_PER_BYTE;
 #if WITH_VAL_SCALES

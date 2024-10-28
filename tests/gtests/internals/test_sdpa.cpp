@@ -1,4 +1,3 @@
-
 /*******************************************************************************
 * Copyright 2024 Intel Corporation
 *
@@ -424,20 +423,18 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
     out.sdpa_attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
 
     out.sdpa_attr_quantized.set_scratchpad_mode(dnnl::scratchpad_mode::library);
-    //out.sdpa_kq_attr_quantized.set_scales(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, p.group_size, 1}, memory::data_type::f16);
-    out.sdpa_vs_attr_quantized.set_scales(DNNL_ARG_WEIGHTS, 1 << 3,
-            {1, 1, 1, p.group_size}, memory::data_type::f16);
+    out.sdpa_kq_attr_quantized.set_scales(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, p.group_size, 1}, memory::data_type::f16);
+    out.sdpa_vs_attr_quantized.set_scales(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, 1, p.group_size}, memory::data_type::f16);
     //out.sdpa_kq_attr_quantized.set_zero_points(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, p.group_size, 1}, memory::data_type::s8);
-    out.sdpa_vs_attr_quantized.set_zero_points(DNNL_ARG_WEIGHTS, 1 << 3,
-            {1, 1, 1, p.group_size}, memory::data_type::s8);
+    //out.sdpa_vs_attr_quantized.set_zero_points(DNNL_ARG_WEIGHTS, 1 << 3, {1, 1, 1, p.group_size}, memory::data_type::s8);
 
     fill_random(query_data);
     fill_random_quantized(key_quantized_data);
     fill_random_quantized(val_quantized_data);
-    //fill_random_scales(key_scale_data);
+    fill_random_scales(key_scale_data);
     fill_random_scales(val_scale_data);
     //fill_random_quantized(key_zp_data);
-    fill_random_quantized(val_zp_data);
+    //fill_random_quantized(val_zp_data);
     fill_mask(mask_data, static_cast<size_t>(p.seq_len));
 
 #if 1
@@ -588,11 +585,11 @@ sdpa_tensors get_descriptors(dnnl::engine &eng, sdpa_dims_t p,
     return out;
 }
 sdpa_dims_t p = {.mb = 1,
-        .seq_len = 128, // k
-        .head_num = 1,
-        .head_size = 64, // d
-        .query_num = 128, // q
-        .group_size = 32};
+        .seq_len = 1024, // k
+        .head_num = 64,
+        .head_size = 128, // d
+        .query_num = 1024, // q
+        .group_size = 128};
 
 TEST(SDPA, compares8tof16) {
 
@@ -610,8 +607,8 @@ TEST(SDPA, compares8tof16) {
     dnnl::stream strm(eng);
 
     memory::data_type dt = memory::data_type::f16;
-    memory::data_type kdt = memory::data_type::f16;
-    memory::data_type vdt = memory::data_type::s8;
+    memory::data_type kdt = memory::data_type::s8;
+    memory::data_type vdt = memory::data_type::s4;
     memory::data_type scale_dt = memory::data_type::f16;
     bool invert_scale = false;
 
@@ -636,34 +633,64 @@ TEST(SDPA, compares8tof16) {
     //print_mem(t.m_value_scales, "value_scale_attr");
     //print_mem(t.m_value_zp, "value_zero_points");
 
-#if 1
+#if 0
     if (!::getenv("SKIP_S8"))
 #endif
-        sdpas8_p.execute(strm,
-                {{DNNL_ARG_QUERIES, t.m_query},
-                        {DNNL_ARG_KEYS, t.m_key_quantized},
-                        //{DNNL_ARG_ATTR_SCALES | DNNL_ARG_KEYS, t.m_key_scales},
-                        //{DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_KEYS, t.m_key_zp},
+        auto loop_s8 =
+                [&] {
+                    sdpas8_p.execute(strm,
+                            {{DNNL_ARG_QUERIES, t.m_query},
+                                    {DNNL_ARG_KEYS, t.m_key_quantized},
+                                    {DNNL_ARG_ATTR_SCALES | DNNL_ARG_KEYS, t.m_key_scales},
+                                    //{DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_KEYS, t.m_key_zp},
 
-                        {DNNL_ARG_VALUES, t.m_value_quantized},
-                        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_VALUES,
-                                t.m_value_scales},
-                        {DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_VALUES,
-                                t.m_value_zp},
+                                    {DNNL_ARG_VALUES, t.m_value_quantized},
+                                    {DNNL_ARG_ATTR_SCALES | DNNL_ARG_VALUES, t.m_value_scales},
+                                    //{DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_VALUES, t.m_value_zp},
 
-                        {DNNL_ARG_SCALE, t.m_scale},
-                        {DNNL_ARG_ATTN_MASK, t.m_mask},
-                        {DNNL_ARG_DST, t.m_output_quantized}});
-#if 1
-    if (!::getenv("SKIP_F16"))
+                                    {DNNL_ARG_SCALE, t.m_scale},
+                                    {DNNL_ARG_ATTN_MASK, t.m_mask},
+                                    {DNNL_ARG_DST, t.m_output_quantized}});
+                };
+    loop_s8();
+#if 0
+                if (!::getenv("SKIP_F16"))
 #endif
+    auto loop_f16 = [&] {
         sdpaf16_p.execute(strm,
                 {{DNNL_ARG_QUERIES, t.m_query}, {DNNL_ARG_KEYS, t.m_key},
                         {DNNL_ARG_VALUES, t.m_value},
                         {DNNL_ARG_SCALE, t.m_scale},
                         {DNNL_ARG_ATTN_MASK, t.m_mask},
                         {DNNL_ARG_DST, t.m_output}});
+    };
+    loop_f16();
+
     strm.wait();
+
+
+    using namespace std::chrono;
+    using namespace std::placeholders;
+    vector<microseconds> time_s8, time_f16;
+
+    auto s = steady_clock::now();
+    for (int i = 0; i < 10; i++) {
+        loop_f16();
+    }
+    strm.wait();
+    auto e = steady_clock::now();
+    time_f16.push_back(duration_cast<microseconds>(e - s));
+
+    s = steady_clock::now();
+    for(int i = 0; i < 10; i++) {
+      loop_s8();
+    }
+    strm.wait();
+    e = steady_clock::now();
+    time_s8.push_back(duration_cast<microseconds>(e - s));
+
+    std::cout << "s8 " << time_s8[0].count() / 10 << " vs f16 " << time_f16[0].count() / 10 << std::endl;
+
     //print_mem(t.m_output, "output");
 
 #if 1
